@@ -155,3 +155,11 @@ def test_stream_retries_while_opening():
     client, sdk, sleeps = make([_status_error(openai.RateLimitError, 429), iter([])])
     assert list(client.stream("hi")) == []
     assert len(sdk.calls) == 2 and sleeps == [1.0]
+
+
+def test_log_creates_schema_on_fresh_db(tmp_db):
+    for f in tmp_db.parent.glob("test.sqlite3*"):
+        f.unlink()
+    client, _, _ = make([_resp()])
+    client.complete([{"role": "user", "content": "hi"}], feature="script")
+    assert len(rows("SELECT * FROM llm_calls")) == 1

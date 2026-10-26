@@ -40,6 +40,30 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        2,
+        """
+        CREATE TABLE firms (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            hubzone INTEGER NOT NULL DEFAULT 0,
+            certifications TEXT NOT NULL DEFAULT '[]',
+            naics_codes TEXT NOT NULL DEFAULT '[]',
+            size_standard TEXT,
+            place_of_performance TEXT,
+            past_performance TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            solicitation_id TEXT NOT NULL,
+            firm_id INTEGER NOT NULL,
+            verdict TEXT NOT NULL CHECK (verdict IN ('bid', 'no_bid', 'needs_review')),
+            score INTEGER NOT NULL,
+            reasons TEXT NOT NULL DEFAULT '[]'
+        );
+        """,
+    ),
 ]
 
 

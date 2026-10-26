@@ -94,6 +94,7 @@ class MetaClient:
 
     def _log(self, feature: str, started: float, usage, error: Exception | None) -> None:
         try:
+            db.init_db()  # idempotent; lets scripts log without going through FastAPI startup
             with db.session() as conn:
                 conn.execute(
                     "INSERT INTO llm_calls (ts, model, feature, prompt_tokens, completion_tokens, latency_ms, ok, error)"
