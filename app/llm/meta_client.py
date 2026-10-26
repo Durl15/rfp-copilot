@@ -1,8 +1,10 @@
-"""Thin wrapper over the anthropic SDK pointed at the Meta Model API.
+"""Thin wrapper over the OpenAI SDK pointed at Meta's Responses API.
 
-Wire-format assumptions (Meta-specific, passed via extra_body so the SDK stays untouched):
-  - reasoning_effort -> top-level "reasoning_effort"
-  - json_schema      -> top-level "response_format": {"type": "json_schema", ...}
+  - reasoning_effort -> reasoning={"effort": ...}
+  - json_schema      -> text={"format": {"type": "json_schema", "name": ..., "schema": ..., "strict": True}}
+  - system           -> instructions
+  - max_tokens       -> max_output_tokens
+Pass a prior result's response_id as previous_response_id to preserve reasoning across agent turns.
 """
 import json
 import logging
@@ -11,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-import anthropic
+import openai
 
 from app import db
 from app.config import Settings, get_settings
@@ -21,6 +23,7 @@ log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 3
 BACKOFF_BASE_S = 1.0
 DEFAULT_MAX_TOKENS = 4096
+EFFORTS = ("minimal", "low", "medium", "high")
 
 
 @dataclass
@@ -29,20 +32,33 @@ class LLMResult:
     prompt_tokens: int
     completion_tokens: int
     raw: Any = field(repr=False, default=None)
+    parsed: Any = None  # decoded JSON when a json_schema was given
+    tool_calls: list[dict] = field(default_factory=list)  # {"call_id", "name", "arguments"}; arguments is a JSON string
+    usage: Any = field(repr=False, default=None)
+    response_id: str | None = None
 
     def json(self) -> Any:
-        return json.loads(self.text)
+        return self.parsed if self.parsed is not None else json.loads(self.text)
+
+
+@dataclass
+class ToolCallDelta:
+    """Streamed tool-call fragment: `name` is set on the first fragment, `arguments` carries JSON text deltas."""
+
+    call_id: str
+    name: str | None = None
+    arguments: str = ""
 
 
 def _retryable(exc: Exception) -> bool:
-    return isinstance(exc, anthropic.APIStatusError) and (exc.status_code == 429 or exc.status_code >= 500)
+    return isinstance(exc, openai.APIStatusError) and (exc.status_code == 429 or exc.status_code >= 500)
 
 
 class MetaClient:
-    def __init__(self, settings: Settings | None = None, client: anthropic.Anthropic | None = None, sleep=time.sleep):
+    def __init__(self, settings: Settings | None = None, client: openai.OpenAI | None = None, sleep=time.sleep):
         self.settings = settings or get_settings()
         # SDK retries disabled: retry policy and call logging live here.
-        self._client = client or anthropic.Anthropic(
+        self._client = client or openai.OpenAI(
             base_url=self.settings.meta_api_base,
             api_key=self.settings.model_api_key or "unset",
             max_retries=0,
@@ -53,23 +69,27 @@ class MetaClient:
     def model(self) -> str:
         return self.settings.meta_model
 
-    def _params(self, messages, system, tools, json_schema, reasoning_effort, max_tokens) -> dict:
+    def _params(
+        self, messages, system, tools, json_schema, schema_name, reasoning_effort, max_tokens, previous_response_id
+    ) -> dict:
+        if reasoning_effort not in EFFORTS:
+            raise ValueError(f"reasoning_effort must be one of {EFFORTS}, got {reasoning_effort!r}")
         params: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
+            "input": messages,
+            "reasoning": {"effort": reasoning_effort},
+            "max_output_tokens": max_tokens,
         }
         if system:
-            params["system"] = system
+            params["instructions"] = system
         if tools:
             params["tools"] = tools
-        extra: dict[str, Any] = {"reasoning_effort": reasoning_effort}
+        if previous_response_id:
+            params["previous_response_id"] = previous_response_id
         if json_schema:
-            extra["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {"name": "output", "schema": json_schema, "strict": True},
+            params["text"] = {
+                "format": {"type": "json_schema", "name": schema_name, "schema": json_schema, "strict": True}
             }
-        params["extra_body"] = extra
         return params
 
     def _log(self, feature: str, started: float, usage, error: Exception | None) -> None:
@@ -103,60 +123,72 @@ class MetaClient:
 
     def complete(
         self,
-        messages: list[dict],
+        messages: list[dict] | str,
         system: str = "",
         tools: list[dict] | None = None,
         json_schema: dict | None = None,
         reasoning_effort: str = "medium",
         feature: str = "",
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        schema_name: str = "output",
+        previous_response_id: str | None = None,
     ) -> LLMResult:
-        params = self._params(messages, system, tools, json_schema, reasoning_effort, max_tokens)
+        params = self._params(
+            messages, system, tools, json_schema, schema_name, reasoning_effort, max_tokens, previous_response_id
+        )
         started = time.monotonic()
         try:
-            msg = self._with_retry(lambda: self._client.messages.create(**params))
+            resp = self._with_retry(lambda: self._client.responses.create(**params))
         except Exception as exc:
             self._log(feature, started, None, exc)
             raise
-        self._log(feature, started, msg.usage, None)
-        text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
-        return LLMResult(text, msg.usage.input_tokens, msg.usage.output_tokens, msg)
+        self._log(feature, started, resp.usage, None)
+        text = resp.output_text or ""
+        tool_calls = [
+            {"call_id": o.call_id, "name": o.name, "arguments": o.arguments}
+            for o in resp.output
+            if getattr(o, "type", None) == "function_call"
+        ]
+        parsed = json.loads(text) if json_schema and text.strip() else None
+        return LLMResult(
+            text, resp.usage.input_tokens, resp.usage.output_tokens, resp, parsed, tool_calls, resp.usage, resp.id
+        )
 
     def stream(
         self,
-        messages: list[dict],
+        messages: list[dict] | str,
         system: str = "",
         tools: list[dict] | None = None,
         json_schema: dict | None = None,
         reasoning_effort: str = "medium",
         feature: str = "",
         max_tokens: int = DEFAULT_MAX_TOKENS,
-    ) -> Iterator[str]:
-        """Yield text deltas. Retries only while opening the stream; one llm_calls row per stream."""
-        params = self._params(messages, system, tools, json_schema, reasoning_effort, max_tokens)
+        schema_name: str = "output",
+        previous_response_id: str | None = None,
+    ) -> Iterator[str | ToolCallDelta]:
+        """Yield text deltas (str) and ToolCallDelta fragments. Retries only while opening the stream; one llm_calls row per stream."""
+        params = self._params(
+            messages, system, tools, json_schema, schema_name, reasoning_effort, max_tokens, previous_response_id
+        )
         started = time.monotonic()
         usage = None
+        call_ids: dict[str, str] = {}  # output item id -> call_id
         try:
-            cm = self._with_retry(lambda: self._open_stream(params))
-            with cm as s:
-                for delta in s.text_stream:
-                    yield delta
-                usage = s.get_final_message().usage
+            events = self._with_retry(lambda: self._client.responses.create(stream=True, **params))
+            for ev in events:
+                kind = ev.type
+                if kind == "response.output_text.delta":
+                    yield ev.delta
+                elif kind == "response.output_item.added" and getattr(ev.item, "type", None) == "function_call":
+                    call_ids[ev.item.id] = ev.item.call_id
+                    yield ToolCallDelta(ev.item.call_id, name=ev.item.name)
+                elif kind == "response.function_call_arguments.delta":
+                    yield ToolCallDelta(call_ids.get(ev.item_id, ev.item_id), arguments=ev.delta)
+                elif kind == "response.completed":
+                    usage = ev.response.usage
+                elif kind in ("response.failed", "response.incomplete", "error"):
+                    raise RuntimeError(f"stream ended with {kind}")
         except Exception as exc:
             self._log(feature, started, None, exc)
             raise
         self._log(feature, started, usage, None)
-
-    def _open_stream(self, params):
-        cm = self._client.messages.stream(**params)
-        # Enter eagerly so 429/5xx on connect surfaces inside the retry loop.
-        stream = cm.__enter__()
-
-        class _Opened:
-            def __enter__(_self):
-                return stream
-
-            def __exit__(_self, *exc):
-                return cm.__exit__(*exc)
-
-        return _Opened()

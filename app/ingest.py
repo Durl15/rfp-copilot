@@ -188,6 +188,7 @@ def fill_gaps(text: str, tags: dict, llm: MetaClient) -> tuple[dict, list[str]]:
             [{"role": "user", "content": prompt}],
             system=_LLM_SYSTEM,
             json_schema=_LLM_SCHEMA,
+            schema_name="solicitation_tags",
             reasoning_effort="low",
             feature="solicitation_tagger",
         )

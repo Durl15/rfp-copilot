@@ -22,14 +22,14 @@ Everything in this repository, built Oct 26 – Nov 4, 2026:
 
 | Capability | Where | Status |
 |---|---|---|
-| Messages API via the Anthropic SDK (`base_url` = Meta endpoint) | `MetaClient.complete` | Used |
-| Structured output (JSON schema) | Tagger gap-fill, `json_schema=` | Used |
-| `reasoning_effort` (low / medium / high) | Every call; tagger uses `low` | Used |
+| Responses API via the OpenAI SDK (`base_url` = Meta endpoint) | `MetaClient.complete` | Used |
+| Structured output (`text.format` JSON schema) | Tagger gap-fill, `json_schema=` | Used |
+| `reasoning.effort` (minimal / low / medium / high) | Every call; tagger uses `low` | Used |
 | Files API | PDF upload on ingest; `file_id` stored on the solicitation | Used |
 | Streaming | `MetaClient.stream` | Implemented, not yet called by a route |
 | Tool use | `tools=` passthrough on `complete` / `stream` | Implemented, not yet called by a route |
 
-Meta-specific parameters (`reasoning_effort`, `response_format`, Files API `purpose`) are sent through `extra_body` / plain HTTP using the assumed wire format documented at the top of `app/llm/meta_client.py` and in `app/ingest.py`. Confirm them against the Meta Model API reference; each is a one-line change.
+Reasoning and structured output use native Responses API parameters (`reasoning`, `text.format`, `previous_response_id`; see the top of `app/llm/meta_client.py`). The Files API `purpose` is still plain HTTP using the assumed wire format in `app/ingest.py`; confirm it against the Meta Model API reference.
 
 ## Setup
 
