@@ -33,9 +33,12 @@ class LLMResult:
     completion_tokens: int
     raw: Any = field(repr=False, default=None)
     parsed: Any = None  # decoded JSON when a json_schema was given
-    tool_calls: list[dict] = field(default_factory=list)  # {"call_id", "name", "arguments"}; arguments is a JSON string
+    tool_calls: list[dict] = field(default_factory=list)  # {"call_id", "name", "arguments"}; arguments is parsed JSON
     usage: Any = field(repr=False, default=None)
     response_id: str | None = None
+    status: str | None = None
+    output_types: list[str] = field(default_factory=list)
+    parse_error: str | None = None  # set when a requested json_schema reply was not valid JSON
 
     def json(self) -> Any:
         return self.parsed if self.parsed is not None else json.loads(self.text)
@@ -144,15 +147,35 @@ class MetaClient:
             self._log(feature, started, None, exc)
             raise
         self._log(feature, started, resp.usage, None)
-        text = resp.output_text or ""
-        tool_calls = [
-            {"call_id": o.call_id, "name": o.name, "arguments": o.arguments}
-            for o in resp.output
-            if getattr(o, "type", None) == "function_call"
-        ]
-        parsed = json.loads(text) if json_schema and text.strip() else None
+        status = getattr(resp, "status", None)
+        if status != "completed":
+            log.warning("response %s status=%s incomplete_details=%s", resp.id, status, getattr(resp, "incomplete_details", None))
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        output_types: list[str] = []
+        for item in resp.output or []:
+            kind = getattr(item, "type", None)
+            output_types.append(str(kind))
+            if kind == "function_call":
+                try:
+                    args = json.loads(item.arguments) if item.arguments else {}
+                except json.JSONDecodeError:
+                    args = item.arguments  # left raw; the tool dispatcher reports it back to the model
+                tool_calls.append({"call_id": item.call_id, "name": item.name, "arguments": args})
+            elif kind == "message":
+                text_parts.extend(
+                    c.text for c in getattr(item, "content", None) or [] if getattr(c, "type", None) == "output_text"
+                )
+        text = "".join(text_parts)
+        parsed, parse_error = None, None
+        if json_schema and not tool_calls and text.strip():
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                parse_error = f"{type(exc).__name__}: {exc}"
         return LLMResult(
-            text, resp.usage.input_tokens, resp.usage.output_tokens, resp, parsed, tool_calls, resp.usage, resp.id
+            text, resp.usage.input_tokens, resp.usage.output_tokens, resp, parsed, tool_calls, resp.usage, resp.id,
+            status, output_types, parse_error,
         )
 
     def stream(

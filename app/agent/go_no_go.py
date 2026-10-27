@@ -1,5 +1,6 @@
 """Go/No-Go agent: the model calls read-only tools until it returns a structured GoNoGo decision."""
 import json
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,6 +11,7 @@ from app.agent import tools
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_TURNS = 8
@@ -74,7 +76,9 @@ def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
     ]
     trace: list[dict] = []
     previous_id = None
-    for _ in range(MAX_TURNS):
+    res = None
+    problem = ""
+    for turn in range(MAX_TURNS):
         res = llm.complete(
             messages,
             system=SYSTEM_PROMPT,
@@ -86,8 +90,19 @@ def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             max_tokens=MAX_TOKENS,
             previous_response_id=previous_id,
         )
+        log.debug(
+            "turn=%d tools=%s output_types=%s usage=%s",
+            turn, [c["name"] for c in res.tool_calls], res.output_types, res.usage,
+        )
         if not res.tool_calls:
-            decision = GoNoGo.model_validate_json(res.text)
+            if res.parsed is None:
+                problem = res.parse_error or "no JSON answer returned"
+                break
+            try:
+                decision = GoNoGo.model_validate(res.parsed)
+            except ValidationError as exc:
+                problem = f"answer failed validation: {exc.error_count()} error(s)"
+                break
             reasons = decision.top_reasons + [f"BLOCKER: {b}" for b in decision.blockers]
             saved = tools.record_decision(solicitation_id, firm_id, decision.verdict, decision.score, reasons)
             return {"decision": decision.model_dump(), "decision_id": saved["decision_id"], "trace": trace}
@@ -100,7 +115,11 @@ def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             trace.append({"tool": call["name"], "args": call["arguments"], "result_summary": _summary(result)})
             outputs.append({"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result, default=str)})
         messages, previous_id = outputs, res.response_id
-    raise RuntimeError(f"go/no-go did not finish within {MAX_TURNS} model turns")
+    last = res.text[:500] if res else ""
+    raise RuntimeError(
+        f"go/no-go did not produce a valid answer within {MAX_TURNS} model turns"
+        f" ({problem or 'tool calls never stopped'}); status={res.status if res else None}; last text: {last!r}"
+    )
 
 
 class GoNoGoIn(BaseModel):

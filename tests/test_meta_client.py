@@ -13,12 +13,16 @@ def _status_error(cls, code):
     return cls("boom", response=resp, body=None)
 
 
+def _msg(text):
+    return SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text=text)])
+
+
 def _resp(text="ok", inp=11, out=7, rid="resp_1", output=()):
     return SimpleNamespace(
         id=rid,
         status="completed",
-        output_text=text,
-        output=list(output),
+        incomplete_details=None,
+        output=([_msg(text)] if text else []) + list(output),
         usage=SimpleNamespace(input_tokens=inp, output_tokens=out),
     )
 
@@ -126,10 +130,19 @@ def test_invalid_effort_rejected_before_calling():
 
 def test_tool_calls_are_returned():
     call = SimpleNamespace(type="function_call", call_id="c1", name="lookup", arguments='{"q": "x"}')
-    msg = SimpleNamespace(type="message")
-    client, _, _ = make([_resp("", output=[msg, call])])
-    res = client.complete("hi", tools=[{"type": "function", "name": "lookup"}])
-    assert res.tool_calls == [{"call_id": "c1", "name": "lookup", "arguments": '{"q": "x"}'}]
+    client, _, _ = make([_resp('{"a": 1}', output=[call])])
+    res = client.complete("hi", tools=[{"type": "function", "name": "lookup"}], json_schema={"type": "object"})
+    assert res.tool_calls == [{"call_id": "c1", "name": "lookup", "arguments": {"q": "x"}}]
+    assert res.parsed is None and res.output_types == ["message", "function_call"]
+
+
+def test_bad_json_does_not_raise_and_incomplete_is_logged(caplog):
+    r = _resp("{oops")
+    r.status, r.incomplete_details = "incomplete", SimpleNamespace(reason="max_output_tokens")
+    client, _, _ = make([r])
+    res = client.complete("hi", json_schema={"type": "object"})
+    assert res.parsed is None and res.text == "{oops" and res.parse_error.startswith("JSONDecodeError")
+    assert res.status == "incomplete" and "max_output_tokens" in caplog.text
 
 
 def test_stream_yields_text_and_tool_deltas_and_logs():

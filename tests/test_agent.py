@@ -1,32 +1,61 @@
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import db, ingest
 from app.agent import go_no_go, tools
-from app.llm.meta_client import LLMResult
+from app.llm.meta_client import MetaClient
 from app.main import app
 from app.routes import get_llm
 from app.seed import seed_firms
 from tests.conftest import SAMPLE_TEXT, rows
 
 
-class FakeLLM:
-    """Replays scripted LLMResults and records the kwargs of each call."""
+def _fn_call(call_id, name, args):
+    return SimpleNamespace(type="function_call", call_id=call_id, name=name, arguments=json.dumps(args))
 
-    def __init__(self, results):
-        self.results = list(results)
+
+def _message(text):
+    return SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text=text)])
+
+
+def _response(rid, *output, status="completed"):
+    return SimpleNamespace(
+        id=rid,
+        status=status,
+        incomplete_details=None,
+        output=list(output),
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+
+
+class FakeSDK:
+    """Replays scripted Responses-API objects and records the kwargs of each responses.create call."""
+
+    def __init__(self, responses):
+        self.responses_left = list(responses)
         self.calls = []
+        self.responses = SimpleNamespace(create=self._create)
 
-    def complete(self, messages, **kw):
-        self.calls.append({"messages": messages, **kw})
-        return self.results.pop(0)
+    def _create(self, **kw):
+        self.calls.append(kw)
+        return self.responses_left.pop(0)
+
+
+def _llm(*responses):
+    sdk = FakeSDK(responses)
+    return MetaClient(client=sdk), sdk
 
 
 def _tool_turn(rid, *calls):
-    return LLMResult("", 1, 1, None, None, [{"call_id": c, "name": n, "arguments": json.dumps(a)} for c, n, a in calls], None, rid)
+    return _response(rid, *[_fn_call(c, n, a) for c, n, a in calls])
+
+
+def _final(rid="r1", payload=None):
+    return _response(rid, _message(json.dumps(payload or FINAL)))
 
 
 FINAL = {
@@ -95,23 +124,22 @@ def test_search_past_performance_and_effort_and_record():
 def test_go_no_go_loop_two_tool_calls_then_final():
     seed_firms()
     sol_id = _solicitation()
-    llm = FakeLLM(
-        [
-            _tool_turn("r1", ("c1", "get_firm_profile", {"firm_id": 1}), ("c2", "get_solicitation", {"solicitation_id": sol_id})),
-            _tool_turn("r2", ("c3", "lookup_naics", {"code": "541512"})),
-            LLMResult(json.dumps(FINAL), 1, 1, None, None, [], None, "r3"),
-        ]
+    llm, sdk = _llm(
+        _tool_turn("r1", ("c1", "get_firm_profile", {"firm_id": 1}), ("c2", "get_solicitation", {"solicitation_id": sol_id})),
+        _tool_turn("r2", ("c3", "lookup_naics", {"code": "541512"})),
+        _final("r3"),
     )
     out = go_no_go.run_go_no_go(1, sol_id, llm)
 
     assert out["decision"]["verdict"] == "bid" and out["decision"]["top_reasons"] == FINAL["top_reasons"][:3]
     assert [t["tool"] for t in out["trace"]] == ["get_firm_profile", "get_solicitation", "lookup_naics"]
     assert all(len(t["result_summary"]) <= go_no_go.SUMMARY_CHARS for t in out["trace"])
-    assert [c.get("previous_response_id") for c in llm.calls] == [None, "r1", "r2"]
-    assert all(c["reasoning_effort"] == "high" and c["max_tokens"] == 4000 and c["feature"] == "go_no_go" for c in llm.calls)
-    assert llm.calls[1]["messages"][0] == {"type": "function_call_output", "call_id": "c1", "output": llm.calls[1]["messages"][0]["output"]}
-    assert len(llm.calls[1]["messages"]) == 2
-    assert "record_decision" not in {t["name"] for t in llm.calls[0]["tools"]}
+    assert [c.get("previous_response_id") for c in sdk.calls] == [None, "r1", "r2"]
+    assert all(c["reasoning"] == {"effort": "high"} and c["max_output_tokens"] == 4000 for c in sdk.calls)
+    first = sdk.calls[1]["input"][0]
+    assert first["type"] == "function_call_output" and first["call_id"] == "c1" and json.loads(first["output"])["name"]
+    assert [i["call_id"] for i in sdk.calls[1]["input"]] == ["c1", "c2"]
+    assert "record_decision" not in {t["name"] for t in sdk.calls[0]["tools"]}
     (saved,) = rows("SELECT * FROM decisions")
     assert (saved["id"], saved["firm_id"], saved["solicitation_id"], saved["score"]) == (out["decision_id"], 1, sol_id, 82)
 
@@ -119,20 +147,49 @@ def test_go_no_go_loop_two_tool_calls_then_final():
 def test_go_no_go_feeds_tool_errors_back_to_model():
     seed_firms()
     sol_id = _solicitation()
-    llm = FakeLLM(
-        [
-            _tool_turn("r1", ("c1", "lookup_naics", {"code": "bad"})),
-            LLMResult(json.dumps(FINAL), 1, 1, None, None, [], None, "r2"),
-        ]
-    )
+    llm, _ = _llm(_tool_turn("r1", ("c1", "lookup_naics", {"code": "bad"})), _final("r2"))
     out = go_no_go.run_go_no_go(1, sol_id, llm)
     assert "invalid arguments" in out["trace"][0]["result_summary"]
+
+
+def test_go_no_go_message_preceded_by_text_in_tool_turn_still_calls_tools():
+    seed_firms()
+    sol_id = _solicitation()
+    llm, sdk = _llm(
+        _response("r1", _message("let me check"), _fn_call("c1", "lookup_naics", {"code": "541512"})),
+        _final("r2"),
+    )
+    out = go_no_go.run_go_no_go(1, sol_id, llm)
+    assert [t["tool"] for t in out["trace"]] == ["lookup_naics"] and len(sdk.calls) == 2
+
+
+def test_go_no_go_unparseable_answer_raises_with_text_and_status():
+    seed_firms()
+    sol_id = _solicitation()
+    llm, _ = _llm(_response("r1", _message("not json " * 100), status="incomplete"))
+    with pytest.raises(RuntimeError) as exc:
+        go_no_go.run_go_no_go(1, sol_id, llm)
+    msg = str(exc.value)
+    assert "status=incomplete" in msg and "not json" in msg and "JSONDecodeError" in msg
+    assert msg.count("not json") <= 500 // len("not json ") + 1
+
+
+def test_go_no_go_invalid_answer_and_turn_limit_raise():
+    seed_firms()
+    sol_id = _solicitation()
+    llm, _ = _llm(_final(payload={**FINAL, "score": 500}))
+    with pytest.raises(RuntimeError, match="validation"):
+        go_no_go.run_go_no_go(1, sol_id, llm)
+    llm, sdk = _llm(*[_tool_turn(f"r{i}", (f"c{i}", "lookup_naics", {"code": "541512"})) for i in range(go_no_go.MAX_TURNS)])
+    with pytest.raises(RuntimeError, match="tool calls never stopped"):
+        go_no_go.run_go_no_go(1, sol_id, llm)
+    assert len(sdk.calls) == go_no_go.MAX_TURNS
 
 
 def test_go_no_go_endpoint():
     seed_firms()
     sol_id = _solicitation()
-    llm = FakeLLM([LLMResult(json.dumps(FINAL), 1, 1, None, None, [], None, "r1")])
+    llm, _ = _llm(_final())
     app.dependency_overrides[get_llm] = lambda: llm
     try:
         client = TestClient(app)

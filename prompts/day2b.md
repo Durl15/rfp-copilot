@@ -1,0 +1,8 @@
+﻿Day 2b: make the agent loop work against the real Responses API.
+
+1. app/llm/meta_client.py complete(): inspect resp.output items explicitly. Collect items with type "function_call" into tool_calls as {call_id, name, arguments(parsed JSON)}. Collect text from items of type "message" -> content[].type "output_text". Only attempt JSON parsing of text when a json_schema was requested AND there are no tool_calls AND text is non-empty; otherwise parsed=None. Never raise JSONDecodeError out of complete(); return raw text and a parse_error field instead. Log resp.status and resp.incomplete_details when status != "completed".
+2. app/agent/go_no_go.py loop: when tool_calls are present, execute each, then send the next request with previous_response_id=resp.id and input = list of {"type": "function_call_output", "call_id": ..., "output": json.dumps(result)}. Repeat up to 8 turns. When a turn returns parsed JSON, validate with the GoNoGo pydantic model and finish. If the loop exits without a valid answer, raise a clear error that includes the last raw text (first 500 chars) and status.
+3. Add DEBUG-level logging of each turn: turn index, tool names called, output types seen, usage. Enable with env LOG_LEVEL=DEBUG.
+4. config.py: load .env with python-dotenv (add to requirements) so uvicorn, scripts and tests all pick up MODEL_API_KEY.
+5. tests: update the mocked model to produce Responses-API-shaped output items (function_call then message/output_text) and assert the loop handles both. All green.
+Commit: "Day 2b: agent loop handles Responses API function_call items; dotenv config". Do not push.

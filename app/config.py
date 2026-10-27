@@ -1,8 +1,13 @@
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO")
 
 
 def _env(key: str, default: str = "") -> str:
