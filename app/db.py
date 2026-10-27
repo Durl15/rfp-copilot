@@ -64,6 +64,26 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        3,
+        """
+        ALTER TABLE llm_calls ADD COLUMN cached_tokens INTEGER;
+        CREATE TABLE matrix_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            solicitation_id TEXT NOT NULL,
+            firm_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            requirement TEXT NOT NULL,
+            section_ref TEXT NOT NULL CHECK (section_ref IN ('C', 'L', 'M')),
+            firm_capability TEXT NOT NULL,
+            gap TEXT NOT NULL CHECK (gap IN ('none', 'partial', 'full')),
+            evidence_needed TEXT NOT NULL,
+            draft_response TEXT NOT NULL
+        );
+        CREATE INDEX idx_matrix_rows_sol_firm ON matrix_rows (solicitation_id, firm_id);
+        """,
+    ),
 ]
 
 

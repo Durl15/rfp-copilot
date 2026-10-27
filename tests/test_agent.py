@@ -63,6 +63,7 @@ FINAL = {
     "verdict": "bid",
     "top_reasons": ["HUBZone set-aside matches", "NAICS 541512 in firm codes", "Relevant AI past performance", "extra"],
     "blockers": [],
+    "rationale_for_verdict": "Set-aside and NAICS match and past performance is relevant, so bid.",
     "estimated_effort_hours": 56,
     "set_aside_match": True,
     "naics_match": True,
@@ -132,6 +133,7 @@ def test_go_no_go_loop_two_tool_calls_then_final():
     out = go_no_go.run_go_no_go(1, sol_id, llm)
 
     assert out["decision"]["verdict"] == "bid" and out["decision"]["top_reasons"] == FINAL["top_reasons"][:3]
+    assert out["decision"]["rationale_for_verdict"] == FINAL["rationale_for_verdict"]
     assert [t["tool"] for t in out["trace"]] == ["get_firm_profile", "get_solicitation", "lookup_naics"]
     assert all(len(t["result_summary"]) <= go_no_go.SUMMARY_CHARS for t in out["trace"])
     assert [c.get("previous_response_id") for c in sdk.calls] == [None, "r1", "r2"]
@@ -142,6 +144,19 @@ def test_go_no_go_loop_two_tool_calls_then_final():
     assert "record_decision" not in {t["name"] for t in sdk.calls[0]["tools"]}
     (saved,) = rows("SELECT * FROM decisions")
     assert (saved["id"], saved["firm_id"], saved["solicitation_id"], saved["score"]) == (out["decision_id"], 1, sol_id, 82)
+
+
+def test_go_no_go_schema_and_prompt_tightened():
+    assert "rationale_for_verdict" in go_no_go.GO_NO_GO_SCHEMA["required"]
+    assert "FIRST must be the single decisive factor" in go_no_go.SYSTEM_PROMPT
+    assert "ONLY hard disqualifiers" in go_no_go.SYSTEM_PROMPT
+
+
+def test_get_solicitation_and_firm_profile_expose_title_and_place_of_performance():
+    seed_firms()
+    sol = tools.get_solicitation(_solicitation())
+    assert sol["title"] == "Solicitation 36C10X26Q0042" and sol["place_of_performance"] == "Syracuse, NY"
+    assert tools.get_firm_profile(1)["place_of_performance"] == "Syracuse, NY"
 
 
 def test_go_no_go_feeds_tool_errors_back_to_model():

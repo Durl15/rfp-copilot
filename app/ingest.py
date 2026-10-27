@@ -101,6 +101,8 @@ _DUE_RE = re.compile(
     re.I,
 )
 _NAICS_RE = re.compile(r"NAICS(?:\s+code)?[^\d\n]{0,20}(\d{6})", re.I)
+_TITLE_RE = re.compile(r"^[ \t]*title[ \t]*:[ \t]*(\S[^\n]*)$", re.I | re.M)
+TITLE_MAX = 200
 _POP_RE = re.compile(r"place\s+of\s+performance\s*[:\-]\s*([^\n]{3,200})", re.I)
 _SET_ASIDES = (
     (r"HUBZone", "HUBZone"),
@@ -137,8 +139,20 @@ def _sections(text: str) -> dict[str, str]:
     return best
 
 
+def _title(text: str) -> str | None:
+    """A 'Title:' line if present, else the first non-empty line that isn't a section marker."""
+    if m := _TITLE_RE.search(text):
+        return m.group(1).strip()[:TITLE_MAX]
+    for line in text.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line and not _SECTION_RE.match(line):
+            return line[:TITLE_MAX]
+    return None
+
+
 def regex_tag(text: str) -> dict:
     out: dict = {f: None for f in FIELDS}
+    out["title"] = _title(text)
     secs = _sections(text)
     out["section_c"], out["section_l"], out["section_m"] = secs.get("C"), secs.get("L"), secs.get("M")
     for m in _DUE_RE.finditer(text):
@@ -230,6 +244,7 @@ def create_solicitation(
     hints: dict | None = None,
 ) -> dict:
     tags, llm_filled = tag_solicitation(text, llm, hints)
+    tags["title"] = title or tags.get("title")
     row = {
         "id": str(uuid.uuid4()),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -237,7 +252,6 @@ def create_solicitation(
         "sam_notice_id": sam_notice_id,
         "filename": filename,
         "file_id": file_id,
-        "title": title,
         "raw_text": text,
         **tags,
         "llm_filled": json.dumps(llm_filled),

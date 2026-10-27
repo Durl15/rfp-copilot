@@ -49,6 +49,13 @@ def test_regex_tagger_extracts_everything_without_llm_call():
     assert filled == [] and llm.calls == []
 
 
+def test_title_extraction():
+    assert ingest.regex_tag("Title: Network Upgrade\nSolicitation 1\n")["title"] == "Network Upgrade"
+    assert ingest.regex_tag("\n\n# Cloud Migration RFQ\nbody")["title"] == "Cloud Migration RFQ"
+    assert ingest.regex_tag(SAMPLE_TEXT)["title"] == "Solicitation 36C10X26Q0042"
+    assert ingest.regex_tag("   \n")["title"] is None
+
+
 def test_toc_hit_does_not_shadow_real_section():
     text = "SECTION C\nSECTION L\nSECTION M\n" + SAMPLE_TEXT
     assert "software modernization" in ingest.regex_tag(text)["section_c"]

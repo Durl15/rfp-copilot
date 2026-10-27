@@ -24,8 +24,12 @@ SYSTEM_PROMPT = (
     "You are a bid-desk analyst for HUBZone small businesses. Decide whether the firm should bid on the solicitation. "
     "Use the tools to read the firm profile and the solicitation, check set-aside and NAICS fit, search past performance "
     "against the scope of work, and estimate effort. Never assume facts the tools did not return. "
-    "A set-aside the firm lacks the certification for, or a NAICS code outside the firm's codes, is a blocker. "
+    "blockers lists ONLY hard disqualifiers: a required certification the firm lacks, a set-aside the firm does not "
+    "qualify for, a NAICS code outside the firm's codes, or a due date that has already passed. Weak fit, thin past "
+    "performance, or effort concerns are NOT blockers; put them in top_reasons. "
+    "top_reasons has at most 3 entries and the FIRST must be the single decisive factor behind the verdict. "
     "Score 0-100 for fit (70+ bid, 40-69 needs_review, below 40 no_bid unless a blocker says otherwise). "
+    "rationale_for_verdict is ONE sentence explaining why the verdict is bid, needs_review, or no_bid rather than the other two. "
     "When you have enough information, reply with the final JSON decision only."
 )
 
@@ -35,6 +39,7 @@ class GoNoGo(BaseModel):
     verdict: Literal["bid", "no_bid", "needs_review"]
     top_reasons: list[str]
     blockers: list[str]
+    rationale_for_verdict: str
     estimated_effort_hours: int = Field(ge=0)
     set_aside_match: bool
     naics_match: bool
@@ -51,8 +56,13 @@ GO_NO_GO_SCHEMA = {
     "properties": {
         "score": {"type": "integer", "description": "Fit score 0-100"},
         "verdict": {"type": "string", "enum": ["bid", "no_bid", "needs_review"]},
-        "top_reasons": {"type": "array", "items": {"type": "string"}, "description": "At most 3 reasons"},
-        "blockers": {"type": "array", "items": {"type": "string"}},
+        "top_reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "At most 3 reasons; the first is the single decisive factor",
+        },
+        "blockers": {"type": "array", "items": {"type": "string"}, "description": "Hard disqualifiers only"},
+        "rationale_for_verdict": {"type": "string", "description": "One sentence: why this verdict and not the others"},
         "estimated_effort_hours": {"type": "integer"},
         "set_aside_match": {"type": "boolean"},
         "naics_match": {"type": "boolean"},

@@ -100,14 +100,15 @@ class MetaClient:
             db.init_db()  # idempotent; lets scripts log without going through FastAPI startup
             with db.session() as conn:
                 conn.execute(
-                    "INSERT INTO llm_calls (ts, model, feature, prompt_tokens, completion_tokens, latency_ms, ok, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO llm_calls (ts, model, feature, prompt_tokens, completion_tokens, cached_tokens, latency_ms, ok, error)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         datetime.now(timezone.utc).isoformat(),
                         self.model,
                         feature,
                         getattr(usage, "input_tokens", None),
                         getattr(usage, "output_tokens", None),
+                        getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", None),
                         int((time.monotonic() - started) * 1000),
                         0 if error else 1,
                         f"{type(error).__name__}: {error}"[:500] if error else None,

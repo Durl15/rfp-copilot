@@ -1,0 +1,9 @@
+﻿Day 3: Compliance Matrix, title extraction, and go/no-go prompt tightening.
+
+1. Tagger: extract title (first heading/"Title:" line) into solicitations.title; fix so get_solicitation returns it. Add place_of_performance to the get_solicitation and get_firm_profile outputs.
+2. Go/No-Go prompt: top_reasons must lead with the single decisive factor; blockers lists only hard disqualifiers (missing required certification, wrong set-aside, NAICS outside firm, due date passed); add a "rationale_for_verdict" string (one sentence) to the GoNoGo schema explaining bid vs needs_review vs no_bid. Update tests.
+3. Compliance Matrix (app/agent/matrix.py): POST /agent/matrix {firm_id, solicitation_id}. Input: Section C/L/M text plus firm profile and past performance (via tools). Output schema ComplianceMatrix {rows: [{requirement, section_ref ("C"|"L"|"M"), firm_capability, gap: "none"|"partial"|"full", evidence_needed, draft_response}], summary: {counts per gap, overall_readiness_pct}}. Use reasoning effort "high", max_output_tokens 8000, structured output, same tool loop as go/no-go with feature "matrix". Every row's firm_capability must cite only facts present in the firm profile or past performance; if absent, gap is "partial" or "full" and evidence_needed says what to provide. Never invent credentials or past performance.
+4. Persist matrix rows in table matrix_rows (solicitation_id, firm_id, ...). GET /agent/matrix/{solicitation_id}?firm_id=.
+5. Prompt caching: put the firm profile and rubric in the stable prefix of the request so repeated runs across opportunities hit cache; log cached_tokens from usage in llm_calls.
+6. Tests with the mocked Responses-shaped model: matrix parse, gap counts, no-invention guard (a row citing a capability not in the profile is rejected and retried once).
+Commit: "Day 3: compliance matrix, title extraction, tightened go/no-go". Do not push.
