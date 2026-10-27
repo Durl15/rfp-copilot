@@ -84,6 +84,13 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX idx_matrix_rows_sol_firm ON matrix_rows (solicitation_id, firm_id);
         """,
     ),
+    (
+        4,
+        """
+        ALTER TABLE matrix_rows ADD COLUMN requirement_type TEXT NOT NULL DEFAULT 'capability'
+            CHECK (requirement_type IN ('capability', 'eligibility', 'submission'));
+        """,
+    ),
 ]
 
 

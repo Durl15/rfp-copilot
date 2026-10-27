@@ -21,6 +21,9 @@ MAX_TOKENS = 8000
 SECTION_CHARS = 15000
 SUMMARY_CHARS = 200
 READINESS_WEIGHT = {"none": 1.0, "partial": 0.5, "full": 0.0}
+REQUIREMENT_TYPES = ("capability", "eligibility", "submission")
+SCORED_TYPES = ("capability", "eligibility")
+NO_EVIDENCE = "No matching evidence in profile."
 # The firm profile is already in the system prompt; the model only needs the solicitation and search tools.
 MODEL_TOOLS = [d for d in tools.TOOL_DEFINITIONS if d["name"] in ("get_solicitation", "search_past_performance", "lookup_naics")]
 
@@ -29,15 +32,26 @@ RUBRIC = (
     "You build compliance matrices for HUBZone small-business federal proposals. "
     "You get the text of Sections C (scope), L (instructions to offerors) and M (evaluation factors) of one solicitation, "
     "and the firm's profile and past performance below. Produce one row per distinct requirement, in section order. "
-    "Rows: requirement (concise, one obligation); section_ref (C, L or M); firm_capability; "
+    "Rows: requirement (concise, one obligation); section_ref (C, L or M); "
+    "requirement_type (capability = work the firm must be able to perform; eligibility = certifications, set-aside, NAICS, "
+    "location, registrations; submission = format, page limits, volumes, deadlines, forms); firm_capability; "
     "gap (none = fully met by documented facts, partial = partly met or unproven, full = nothing documented); "
-    "evidence_needed (what the firm must provide to close the gap; empty string when gap is none); "
-    "draft_response (proposal-ready prose using only documented facts; for a gap, a short response that states the plan "
-    "without claiming experience or credentials the firm does not have).\n"
+    "evidence_needed (what the firm must provide to close the gap; empty string when gap is none, except an eligibility "
+    "requirement met by a quoted certification, where it holds only a verification action such as "
+    "\"Confirm HUBZone status is active in SAM.gov before submission\"); draft_response.\n"
+    "SUBMISSION ROWS: gap is always none, firm_capability is exactly \"" + NO_EVIDENCE + "\", evidence_needed is empty, and "
+    "draft_response is a short action item (e.g. Prepare technical volume within 15 pages) with no capability claims.\n"
+    "DRAFT_RESPONSE RULES for capability and eligibility rows:\n"
+    "- gap none: may state the capability, using only facts quoted in firm_capability.\n"
+    "- gap partial: draft only from quoted evidence and end with one sentence naming what still has to be supplied.\n"
+    "- gap full: must NOT claim capability. Begin with \"Gap:\", state what is missing, then give one closing option "
+    "from: teaming partner, subcontractor, hire, or acquire certification. Never write \"We will\" deliver, execute or "
+    "provide for a capability the profile does not show.\n"
     "GROUNDING RULES - these are checked by code and violations are rejected:\n"
     "1. firm_capability may rely ONLY on facts present in the firm profile or past performance below. "
     "Every fact must be quoted verbatim in double quotes, copied exactly from the profile data (e.g. \"HUBZone\", \"541512\"). "
-    "Do not put double quotes around anything else.\n"
+    "Do not put double quotes around anything else. Every sentence in firm_capability must contain such a quote, "
+    "or be exactly \"" + NO_EVIDENCE + "\".\n"
     "2. gap \"none\" requires at least one such verbatim quote. If you cannot quote a documented fact, the gap is "
     "\"partial\" or \"full\" and evidence_needed says what to provide.\n"
     "3. Never invent credentials, clearances, certifications, contract numbers, customers, dollar values or past performance. "
@@ -46,11 +60,13 @@ RUBRIC = (
 )
 
 _QUOTE_RE = re.compile(r'"([^"]+)"')
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 class MatrixRow(BaseModel):
     requirement: str
     section_ref: Literal["C", "L", "M"]
+    requirement_type: Literal["capability", "eligibility", "submission"]
     firm_capability: str
     gap: Literal["none", "partial", "full"]
     evidence_needed: str
@@ -63,6 +79,7 @@ class ModelMatrix(BaseModel):
 
 class Summary(BaseModel):
     counts: dict[str, int]
+    counts_by_type: dict[str, int]
     overall_readiness_pct: int
 
 
@@ -82,6 +99,7 @@ MATRIX_SCHEMA = {
                 "properties": {
                     "requirement": {"type": "string"},
                     "section_ref": {"type": "string", "enum": ["C", "L", "M"]},
+                    "requirement_type": {"type": "string", "enum": list(REQUIREMENT_TYPES)},
                     "firm_capability": {"type": "string", "description": "Documented facts, each quoted verbatim"},
                     "gap": {"type": "string", "enum": ["none", "partial", "full"]},
                     "evidence_needed": {"type": "string"},
@@ -99,8 +117,10 @@ MATRIX_SCHEMA = {
 
 def summarize(rows: list[MatrixRow]) -> Summary:
     counts = {g: sum(r.gap == g for r in rows) for g in READINESS_WEIGHT}
-    pct = round(100 * sum(READINESS_WEIGHT[r.gap] for r in rows) / len(rows)) if rows else 0
-    return Summary(counts=counts, overall_readiness_pct=pct)
+    scored = [r for r in rows if r.requirement_type in SCORED_TYPES]
+    pct = round(100 * sum(READINESS_WEIGHT[r.gap] for r in scored) / len(scored)) if scored else 0
+    counts_by_type = {t: sum(r.requirement_type == t for r in rows) for t in REQUIREMENT_TYPES}
+    return Summary(counts=counts, counts_by_type=counts_by_type, overall_readiness_pct=pct)
 
 
 def _norm(s: str) -> str:
@@ -115,19 +135,41 @@ def _leaves(value) -> list[str]:
     return [] if value is None else [_norm(str(value))]
 
 
+def _unquoted_sentences(text: str) -> list[str]:
+    """Sentences with no verbatim quote that are not the exact no-evidence sentence."""
+    masked = _QUOTE_RE.sub("QUOTE", text)  # periods inside a quote must not split sentences
+    return [
+        part for part in _SENTENCE_SPLIT_RE.split(masked.strip())
+        if part and "QUOTE" not in part and part != NO_EVIDENCE
+    ]
+
+
 def check_grounding(rows: list[MatrixRow], firm: dict) -> list[str]:
-    """Problems that make the model retry: quoted capability facts absent from the profile, or gap 'none' with no quote."""
+    """Problems that make the model retry: ungrounded or unquoted capability claims, and draft_response rule breaks."""
     facts = _leaves(firm)
     problems = []
     for i, row in enumerate(rows, 1):
+        label = f"row {i} ({row.requirement[:60]!r})"
+        submission = row.requirement_type == "submission"
         quotes = _QUOTE_RE.findall(row.firm_capability)
         bad = [q for q in quotes if not any(_norm(q) in f for f in facts)]
+        loose = _unquoted_sentences(row.firm_capability)
         if bad:
-            problems.append(f"row {i} ({row.requirement[:60]!r}) cites facts not in the firm profile: {bad}")
-        elif row.gap == "none" and not quotes:
-            problems.append(f"row {i} ({row.requirement[:60]!r}) has gap 'none' but quotes no documented fact")
+            problems.append(f"{label} cites facts not in the firm profile: {bad}")
+        elif loose:
+            problems.append(f"{label} has firm_capability sentences with no verbatim quote (use exactly {NO_EVIDENCE!r}): {loose}")
+        elif row.gap == "none" and not submission and not quotes:
+            problems.append(f"{label} has gap 'none' but quotes no documented fact")
+        if submission:
+            if row.gap != "none":
+                problems.append(f"{label} is a submission requirement, so gap must be 'none'")
+            continue
         if row.gap != "none" and not row.evidence_needed.strip():
-            problems.append(f"row {i} ({row.requirement[:60]!r}) has a gap but empty evidence_needed")
+            problems.append(f"{label} has a gap but empty evidence_needed")
+        if row.gap == "full":
+            draft = row.draft_response.strip()
+            if not draft.startswith("Gap:") or draft.lower().startswith("we will"):
+                problems.append(f"{label} has gap 'full' so draft_response must begin with 'Gap:' and must not begin with 'We will'")
     return problems
 
 
@@ -204,7 +246,8 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         messages = [{
             "role": "user",
             "content": "Your matrix was rejected: " + problem + ". Fix these rows, quoting only facts present in the firm "
-            "profile (otherwise use gap partial or full and say what evidence is needed), and return the full matrix JSON.",
+            "profile (otherwise use gap partial or full and say what evidence is needed), following the SUBMISSION ROWS and "
+            "DRAFT_RESPONSE RULES, and return the full matrix JSON.",
         }]
         previous_id = res.response_id
     last = res.text[:500] if res else ""
@@ -220,10 +263,11 @@ def _save_rows(solicitation_id: str, firm_id: int, rows: list[MatrixRow]) -> Non
         conn.execute("DELETE FROM matrix_rows WHERE solicitation_id = ? AND firm_id = ?", (solicitation_id, firm_id))
         conn.executemany(
             "INSERT INTO matrix_rows (created_at, solicitation_id, firm_id, position, requirement, section_ref,"
-            " firm_capability, gap, evidence_needed, draft_response) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " requirement_type, firm_capability, gap, evidence_needed, draft_response)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (now, solicitation_id, firm_id, i, r.requirement, r.section_ref, r.firm_capability, r.gap,
-                 r.evidence_needed, r.draft_response)
+                (now, solicitation_id, firm_id, i, r.requirement, r.section_ref, r.requirement_type,
+                 r.firm_capability, r.gap, r.evidence_needed, r.draft_response)
                 for i, r in enumerate(rows)
             ],
         )
