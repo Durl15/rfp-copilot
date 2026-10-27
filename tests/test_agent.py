@@ -22,11 +22,11 @@ def _message(text):
     return SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text=text)])
 
 
-def _response(rid, *output, status="completed"):
+def _response(rid, *output, status="completed", incomplete_reason=None):
     return SimpleNamespace(
         id=rid,
         status=status,
-        incomplete_details=None,
+        incomplete_details=SimpleNamespace(reason=incomplete_reason) if incomplete_reason else None,
         output=list(output),
         usage=SimpleNamespace(input_tokens=1, output_tokens=1),
     )
@@ -137,7 +137,7 @@ def test_go_no_go_loop_two_tool_calls_then_final():
     assert [t["tool"] for t in out["trace"]] == ["get_firm_profile", "get_solicitation", "lookup_naics"]
     assert all(len(t["result_summary"]) <= go_no_go.SUMMARY_CHARS for t in out["trace"])
     assert [c.get("previous_response_id") for c in sdk.calls] == [None, "r1", "r2"]
-    assert all(c["reasoning"] == {"effort": "high"} and c["max_output_tokens"] == 4000 for c in sdk.calls)
+    assert all(c["reasoning"] == {"effort": "high"} and c["max_output_tokens"] == 8000 for c in sdk.calls)
     first = sdk.calls[1]["input"][0]
     assert first["type"] == "function_call_output" and first["call_id"] == "c1" and json.loads(first["output"])["name"]
     assert [i["call_id"] for i in sdk.calls[1]["input"]] == ["c1", "c2"]
@@ -216,3 +216,27 @@ def test_go_no_go_endpoint():
         assert client.get("/firms/99").status_code == 404
     finally:
         app.dependency_overrides.clear()
+
+
+def test_go_no_go_retries_once_on_max_output_tokens():
+    seed_firms()
+    sol_id = _solicitation()
+    llm, sdk = _llm(_response("r1", status="incomplete", incomplete_reason="max_output_tokens"), _final("r2"))
+    out = go_no_go.run_go_no_go(1, sol_id, llm)
+
+    assert out["decision"]["verdict"] == "bid"
+    assert [(c["reasoning"]["effort"], c["max_output_tokens"]) for c in sdk.calls] == [("high", 8000), ("medium", 16000)]
+
+
+def test_retry_doubles_tokens_up_to_cap_and_lowers_effort_to_floor():
+    llm, sdk = _llm(
+        _response("r1", status="incomplete", incomplete_reason="max_output_tokens"),
+        _response("r2", _message("{}")),
+    )
+    llm.complete("hi", reasoning_effort="minimal", max_tokens=40000)
+    assert [(c["reasoning"]["effort"], c["max_output_tokens"]) for c in sdk.calls] == [("minimal", 40000), ("minimal", 48000)]
+
+
+def test_other_incomplete_reasons_are_not_retried():
+    llm, sdk = _llm(_response("r1", status="incomplete", incomplete_reason="content_filter"))
+    assert llm.complete("hi").status == "incomplete" and len(sdk.calls) == 1

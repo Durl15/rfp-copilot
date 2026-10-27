@@ -24,6 +24,7 @@ MAX_ATTEMPTS = 3
 BACKOFF_BASE_S = 1.0
 DEFAULT_MAX_TOKENS = 4096
 EFFORTS = ("minimal", "low", "medium", "high")
+RETRY_MAX_TOKENS_CAP = 48000
 
 
 @dataclass
@@ -126,6 +127,28 @@ class MetaClient:
                     raise
                 self._sleep(BACKOFF_BASE_S * 2 ** (attempt - 1))
 
+    def _create_response(
+        self, messages, system, tools, json_schema, schema_name, reasoning_effort, feature, max_tokens, previous_response_id
+    ):
+        params = self._params(
+            messages, system, tools, json_schema, schema_name, reasoning_effort, max_tokens, previous_response_id
+        )
+        started = time.monotonic()
+        try:
+            resp = self._with_retry(lambda: self._client.responses.create(**params))
+        except Exception as exc:
+            self._log(feature, started, None, exc)
+            raise
+        self._log(feature, started, resp.usage, None)
+        usage = resp.usage
+        reasoning = getattr(getattr(usage, "output_tokens_details", None), "reasoning_tokens", None)
+        log.debug(
+            "feature=%s effort=%s max_output_tokens=%d status=%s reasoning_tokens=%s visible_output_tokens=%s",
+            feature, reasoning_effort, max_tokens, getattr(resp, "status", None), reasoning,
+            usage.output_tokens - reasoning if isinstance(reasoning, int) else None,
+        )
+        return resp
+
     def complete(
         self,
         messages: list[dict] | str,
@@ -138,17 +161,22 @@ class MetaClient:
         schema_name: str = "output",
         previous_response_id: str | None = None,
     ) -> LLMResult:
-        params = self._params(
-            messages, system, tools, json_schema, schema_name, reasoning_effort, max_tokens, previous_response_id
+        resp = self._create_response(
+            messages, system, tools, json_schema, schema_name, reasoning_effort, feature, max_tokens, previous_response_id
         )
-        started = time.monotonic()
-        try:
-            resp = self._with_retry(lambda: self._client.responses.create(**params))
-        except Exception as exc:
-            self._log(feature, started, None, exc)
-            raise
-        self._log(feature, started, resp.usage, None)
         status = getattr(resp, "status", None)
+        incomplete = getattr(resp, "incomplete_details", None)
+        if status == "incomplete" and getattr(incomplete, "reason", None) == "max_output_tokens":
+            retry_tokens = min(max_tokens * 2, RETRY_MAX_TOKENS_CAP)
+            retry_effort = EFFORTS[max(EFFORTS.index(reasoning_effort) - 1, 0)]
+            log.warning(
+                "response %s hit max_output_tokens=%d at effort=%s; retrying once with max_output_tokens=%d effort=%s",
+                resp.id, max_tokens, reasoning_effort, retry_tokens, retry_effort,
+            )
+            resp = self._create_response(
+                messages, system, tools, json_schema, schema_name, retry_effort, feature, retry_tokens, previous_response_id
+            )
+            status = getattr(resp, "status", None)
         if status != "completed":
             log.warning("response %s status=%s incomplete_details=%s", resp.id, status, getattr(resp, "incomplete_details", None))
         text_parts: list[str] = []

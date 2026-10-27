@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_TURNS = 8
-MAX_TOKENS = 8000
+MAX_TOKENS = 24000
 SECTION_CHARS = 15000
 SUMMARY_CHARS = 200
 READINESS_WEIGHT = {"none": 1.0, "partial": 0.5, "full": 0.0}
@@ -209,7 +209,7 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             tools=MODEL_TOOLS,
             json_schema=MATRIX_SCHEMA,
             schema_name="compliance_matrix",
-            reasoning_effort="high",
+            reasoning_effort="medium",
             feature="matrix",
             max_tokens=MAX_TOKENS,
             previous_response_id=previous_id,

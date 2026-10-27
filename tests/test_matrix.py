@@ -7,7 +7,7 @@ from app.main import app
 from app.routes import get_llm
 from app.seed import seed_firms
 from tests.conftest import rows
-from tests.test_agent import _final, _llm, _solicitation, _tool_turn
+from tests.test_agent import _final, _llm, _response, _solicitation, _tool_turn
 
 GOOD_ROWS = [
     {
@@ -64,7 +64,7 @@ def test_matrix_parse_gap_counts_and_persistence():
     }
     assert [r["section_ref"] for r in out["matrix"]["rows"]] == ["C", "L", "M"]
     assert [t["tool"] for t in out["trace"]] == ["search_past_performance"]
-    assert all(c["reasoning"] == {"effort": "high"} and c["max_output_tokens"] == 8000 for c in sdk.calls)
+    assert all(c["reasoning"] == {"effort": "medium"} and c["max_output_tokens"] == 24000 for c in sdk.calls)
     assert {t["name"] for t in sdk.calls[0]["tools"]} == {"get_solicitation", "search_past_performance", "lookup_naics"}
     saved = rows("SELECT solicitation_id, firm_id, gap FROM matrix_rows ORDER BY position")
     assert [(r["solicitation_id"], r["firm_id"], r["gap"]) for r in saved] == [
@@ -185,3 +185,16 @@ def test_readiness_ignores_submission_rows():
     assert matrix.summarize(only_submission).overall_readiness_pct == 0
     assert matrix.summarize(rows).overall_readiness_pct == 50
     assert matrix.summarize(rows).counts_by_type["submission"] == 1
+
+
+def test_matrix_retries_once_on_max_output_tokens():
+    seed_firms()
+    sol_id = _solicitation()
+    llm, sdk = _llm(
+        _response("r1", status="incomplete", incomplete_reason="max_output_tokens"),
+        _matrix_final("r2", GOOD_ROWS),
+    )
+    out = matrix.run_matrix(1, sol_id, llm)
+
+    assert len(out["matrix"]["rows"]) == 3
+    assert [(c["reasoning"]["effort"], c["max_output_tokens"]) for c in sdk.calls] == [("medium", 24000), ("low", 48000)]

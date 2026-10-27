@@ -139,7 +139,7 @@ def test_tool_calls_are_returned():
 def test_bad_json_does_not_raise_and_incomplete_is_logged(caplog):
     r = _resp("{oops")
     r.status, r.incomplete_details = "incomplete", SimpleNamespace(reason="max_output_tokens")
-    client, _, _ = make([r])
+    client, _, _ = make([r, r])  # the max_output_tokens retry is also incomplete
     res = client.complete("hi", json_schema={"type": "object"})
     assert res.parsed is None and res.text == "{oops" and res.parse_error.startswith("JSONDecodeError")
     assert res.status == "incomplete" and "max_output_tokens" in caplog.text

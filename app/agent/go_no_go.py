@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_TURNS = 8
-MAX_TOKENS = 4000
+MAX_TOKENS = 8000
 SUMMARY_CHARS = 200
 # record_decision is persisted by this module after the final answer, so the model never sees it.
 MODEL_TOOLS = [d for d in tools.TOOL_DEFINITIONS if d["name"] != "record_decision"]
