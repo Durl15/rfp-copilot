@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -24,6 +25,16 @@ READINESS_WEIGHT = {"none": 1.0, "partial": 0.5, "full": 0.0}
 REQUIREMENT_TYPES = ("capability", "eligibility", "submission")
 SCORED_TYPES = ("capability", "eligibility")
 NO_EVIDENCE = "No matching evidence in profile."
+# Past-performance requirements are eligibility rows whose gap is computed in code, never submission rows.
+PAST_PERFORMANCE_RE = re.compile(r"past[\s-]+performance|references?|experience|similar\s+(?:in\s+)?(?:size|scope)", re.I)
+PP_NONE_MIN = 3  # matching entries needed for gap none; 1..2 is partial, 0 is full
+PP_KEYWORDS = 10
+_STOPWORDS = frozenset(
+    "shall will must that this with from have been their they them than then which where when "
+    "provide provided providing contractor contract offeror government agency services service "
+    "work include including required requirements requirement under such each other into also "
+    "support perform performance using used personnel period section task tasks".split()
+)
 # The firm profile is already in the system prompt; the model only needs the solicitation and search tools.
 MODEL_TOOLS = [d for d in tools.TOOL_DEFINITIONS if d["name"] in ("get_solicitation", "search_past_performance", "lookup_naics")]
 
@@ -34,7 +45,8 @@ RUBRIC = (
     "and the firm's profile and past performance below. Produce one row per distinct requirement, in section order. "
     "Rows: requirement (concise, one obligation); section_ref (C, L or M); "
     "requirement_type (capability = work the firm must be able to perform; eligibility = certifications, set-aside, NAICS, "
-    "location, registrations; submission = format, page limits, volumes, deadlines, forms); firm_capability; "
+    "location, registrations, and any request for past performance, references, or experience of similar size or scope; "
+    "submission = format, page limits, volumes, deadlines, forms - never references or past performance); firm_capability; "
     "gap (none = fully met by documented facts, partial = partly met or unproven, full = nothing documented); "
     "evidence_needed (what the firm must provide to close the gap; empty string when gap is none, except an eligibility "
     "requirement met by a quoted certification, where it holds only a verification action such as "
@@ -116,11 +128,43 @@ MATRIX_SCHEMA = {
 
 
 def summarize(rows: list[MatrixRow]) -> Summary:
-    counts = {g: sum(r.gap == g for r in rows) for g in READINESS_WEIGHT}
     scored = [r for r in rows if r.requirement_type in SCORED_TYPES]
+    counts = {g: sum(r.gap == g for r in scored) for g in READINESS_WEIGHT}
     pct = round(100 * sum(READINESS_WEIGHT[r.gap] for r in scored) / len(scored)) if scored else 0
-    counts_by_type = {t: sum(r.requirement_type == t for r in rows) for t in REQUIREMENT_TYPES}
+    counts_by_type = {t: sum(r.requirement_type == t for r in scored) for t in SCORED_TYPES}
     return Summary(counts=counts, counts_by_type=counts_by_type, overall_readiness_pct=pct)
+
+
+def _scope_keywords(sol: dict) -> list[str]:
+    """Most frequent content words of Section C (title when there is no Section C), for matching past performance."""
+    words = re.findall(r"[a-z]{4,}", (sol["section_c"] or sol["title"] or "").lower())
+    return [w for w, _ in Counter(w for w in words if w not in _STOPWORDS).most_common(PP_KEYWORDS)]
+
+
+def apply_past_performance(rows: list[MatrixRow], firm_id: int, sol: dict) -> list[MatrixRow]:
+    """Force past-performance rows to eligibility and compute type, gap, evidence and draft from the firm's entries."""
+    keywords = _scope_keywords(sol)
+    matches = tools.search_past_performance(firm_id, keywords)["matches"] if keywords else []
+    quoted = [f'"{m["scope"]}" for "{m["client"]}".' for m in matches]
+    n = len(matches)
+    gap = "none" if n >= PP_NONE_MIN else "partial" if n else "full"
+    capability = " ".join(quoted) or NO_EVIDENCE
+    if gap == "none":
+        evidence, draft = "", "Past performance of similar scope is documented: " + " ".join(quoted)
+    elif gap == "partial":
+        evidence = f"Provide {PP_NONE_MIN - n} more past-performance reference(s) of similar size and scope"
+        draft = ("Documented similar-scope past performance: " + " ".join(quoted)
+                 + f" Still to supply: {PP_NONE_MIN - n} more reference(s) of similar size and scope.")
+    else:
+        evidence = f"Provide {PP_NONE_MIN} past-performance references of similar size and scope"
+        draft = "Gap: no past performance of similar scope is documented. Option: teaming partner with relevant contract history."
+    return [
+        r.model_copy(update={
+            "requirement_type": "eligibility", "firm_capability": capability, "gap": gap,
+            "evidence_needed": evidence, "draft_response": draft,
+        }) if PAST_PERFORMANCE_RE.search(r.requirement) else r
+        for r in rows
+    ]
 
 
 def _norm(s: str) -> str:
@@ -161,6 +205,8 @@ def check_grounding(rows: list[MatrixRow], firm: dict) -> list[str]:
         elif row.gap == "none" and not submission and not quotes:
             problems.append(f"{label} has gap 'none' but quotes no documented fact")
         if submission:
+            if PAST_PERFORMANCE_RE.search(row.requirement):
+                problems.append(f"{label} mentions references, past performance or experience, so requirement_type must be 'eligibility', not 'submission'")
             if row.gap != "none":
                 problems.append(f"{label} is a submission requirement, so gap must be 'none'")
             continue
@@ -231,7 +277,7 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             problems = [res.parse_error or "no JSON answer returned"]
         else:
             try:
-                rows = ModelMatrix.model_validate(res.parsed).rows
+                rows = apply_past_performance(ModelMatrix.model_validate(res.parsed).rows, firm_id, sol)
                 problems = check_grounding(rows, firm) if rows else ["rows is empty"]
             except ValidationError as exc:
                 problems = [f"answer failed validation: {exc.error_count()} error(s)"]

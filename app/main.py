@@ -2,8 +2,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app import firms, routes, shortlist
-from app.agent import go_no_go, matrix
+from app import export, firms, routes, shortlist
+from app.agent import capability, go_no_go, matrix, narrative
 from app.db import init_db
 from app.seed import seed_firms
 
@@ -21,6 +21,9 @@ app.include_router(shortlist.router)
 app.include_router(firms.router)
 app.include_router(go_no_go.router)
 app.include_router(matrix.router)
+app.include_router(narrative.router)
+app.include_router(capability.router)
+app.include_router(export.router)
 
 
 @app.get("/health")

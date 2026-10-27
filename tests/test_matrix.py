@@ -58,8 +58,8 @@ def test_matrix_parse_gap_counts_and_persistence():
     out = matrix.run_matrix(1, sol_id, llm)
 
     assert out["matrix"]["summary"] == {
-        "counts": {"none": 2, "partial": 0, "full": 1},
-        "counts_by_type": {"capability": 2, "eligibility": 0, "submission": 1},
+        "counts": {"none": 1, "partial": 0, "full": 1},
+        "counts_by_type": {"capability": 1, "eligibility": 1},
         "overall_readiness_pct": 50,
     }
     assert [r["section_ref"] for r in out["matrix"]["rows"]] == ["C", "L", "M"]
@@ -104,7 +104,7 @@ def test_invented_capability_is_rejected_and_retried_once():
     assert len(sdk.calls) == 2 and sdk.calls[1]["previous_response_id"] == "r1"
     feedback = sdk.calls[1]["input"][0]["content"]
     assert "rejected" in feedback and "TS/SCI facility clearance" in feedback
-    assert out["matrix"]["summary"]["counts"]["none"] == 2
+    assert out["matrix"]["summary"]["counts"]["none"] == 1
 
 
 def test_gap_none_without_quoted_fact_is_rejected_and_second_failure_raises():
@@ -165,7 +165,7 @@ def test_submission_rows_must_have_gap_none():
 def test_full_gap_draft_starting_we_will_is_rejected_and_retried():
     seed_firms()
     sol_id = _solicitation()
-    bad = {**GOOD_ROWS[2], "draft_response": "We will deliver this capability."}
+    bad = {**GOOD_ROWS[2], "requirement": "Contractor shall provide a 24/7 help desk", "draft_response": "We will deliver this capability."}
     llm, sdk = _llm(_matrix_final("r1", [bad]), _matrix_final("r2", GOOD_ROWS))
     matrix.run_matrix(1, sol_id, llm)
     assert len(sdk.calls) == 2 and "must begin with 'Gap:'" in sdk.calls[1]["input"][0]["content"]
@@ -184,7 +184,7 @@ def test_readiness_ignores_submission_rows():
     only_submission = [rows[1]]
     assert matrix.summarize(only_submission).overall_readiness_pct == 0
     assert matrix.summarize(rows).overall_readiness_pct == 50
-    assert matrix.summarize(rows).counts_by_type["submission"] == 1
+    assert "submission" not in matrix.summarize(rows).counts_by_type
 
 
 def test_matrix_retries_once_on_max_output_tokens():

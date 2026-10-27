@@ -91,6 +91,19 @@ MIGRATIONS: list[tuple[int, str]] = [
             CHECK (requirement_type IN ('capability', 'eligibility', 'submission'));
         """,
     ),
+    (
+        5,
+        """
+        CREATE TABLE artifacts (
+            solicitation_id TEXT NOT NULL,
+            firm_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('narrative', 'capability')),
+            created_at TEXT NOT NULL,
+            content TEXT NOT NULL,
+            PRIMARY KEY (solicitation_id, firm_id, kind)
+        );
+        """,
+    ),
 ]
 
 
