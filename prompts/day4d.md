@@ -1,0 +1,6 @@
+﻿Day 4d: matrix and packet polish.
+1. Add requirement_type "evaluation" for Section M evaluation factors and weights. Treat them like submission rows: gap always "none", firm_capability exactly "No matching evidence in profile.", draft a short action item such as "Weighting noted; structure the proposal to address it." Exclude them from counts and readiness. Validator rejects an evaluation row with any other gap. Never run past-performance matching for evaluation rows.
+2. Past-performance matching runs only for the single row about references or experience, never for Section M rows.
+3. DOCX matrix table: column widths requirement 30%, type 12%, gap 8%, draft 50%; 9pt font in the table; repeat the header row on each page. For past-performance rows with matches, render a one-line summary plus up to three bullets (first 8 words of each matched entry) instead of full quotes; keep full quotes in the JSON.
+4. Any draft about local presence must say "Based in" plus the profile's place_of_performance, never "office". Add this to the prompt and the validator (reject "office" unless the word appears in the profile).
+5. Tests for each point. Commit: "Day 4d: evaluation row type, compact docx, wording guard". Do not push.
