@@ -1,6 +1,7 @@
 """DOCX export: capability statement, compliance matrix, or full bid packet."""
 import io
 import json
+import re
 from typing import Literal
 
 from docx import Document
@@ -13,9 +14,14 @@ from fastapi.responses import Response
 
 from app import db, firms, ingest
 from app.agent import artifacts
-from app.agent.matrix import load_matrix
+from app.agent.matrix import PAST_PERFORMANCE_RE, load_matrix
 
 router = APIRouter()
+
+MATRIX_WIDTHS = [0.30, 0.12, 0.08, 0.50]
+PP_BULLET_WORDS = 8
+# firm_capability of a matched past-performance row is built as: "<quote>" for "<client>". or "<quote>".
+_PP_ENTRY_RE = re.compile(r'"([^"]+)"(?: for "([^"]+)")?\.')
 
 HEADER = "RFP Copilot | DJ AI Business Consultant LLC"
 FOOTER = "Draft for human review. Verify every fact before submission."
@@ -43,7 +49,8 @@ def _new_doc() -> Document:
     return doc
 
 
-def _table(doc: Document, headers: list[str], rows: list[list[str]]) -> None:
+def _table(doc: Document, headers: list[str], rows: list[list[str | list[str]]], widths: list[float] | None = None) -> None:
+    """A cell value is text, or [summary, *bullets]. widths are fractions of the text width."""
     t = doc.add_table(rows=1, cols=len(headers))
     borders = OxmlElement("w:tblBorders")
     for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
@@ -57,11 +64,24 @@ def _table(doc: Document, headers: list[str], rows: list[list[str]]) -> None:
         run.bold, run.font.color.rgb = True, ACCENT
     for row in rows:
         for cell, val in zip(t.add_row().cells, row):
-            cell.text = val
+            head, *bullets = [val] if isinstance(val, str) else val
+            cell.text = head
+            for b in bullets:
+                cell.add_paragraph(b, style="List Bullet")
     for r in t.rows:
         for cell in r.cells:
-            for run in cell.paragraphs[0].runs:
-                run.font.size = Pt(9)
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.font.size = Pt(9)
+    repeat = OxmlElement("w:tblHeader")
+    t.rows[0]._tr.get_or_add_trPr().append(repeat)
+    if widths:
+        sec = doc.sections[0]
+        total = sec.page_width - sec.left_margin - sec.right_margin
+        t.autofit = False
+        for r in t.rows:
+            for cell, w in zip(r.cells, widths):
+                cell.width = int(total * w)
 
 
 def _bullets(doc: Document, items: list[str]) -> None:
@@ -84,12 +104,30 @@ def _capability(doc: Document, cap: dict) -> None:
         _bullets(doc, cap[key])
 
 
+def _pp_draft(r: dict) -> str | list[str]:
+    """Compact form of a past-performance draft: a one-line summary and up to three bullets. Full quotes stay in the JSON."""
+    is_pp = r["requirement_type"] == "eligibility" and r["section_ref"] != "M" and PAST_PERFORMANCE_RE.search(r["requirement"])
+    entries = _PP_ENTRY_RE.findall(r["firm_capability"]) if is_pp else []
+    if not entries:
+        return r["draft_response"]
+    n = len(entries)
+    summary = f"{n} matching past-performance {'entry' if n == 1 else 'entries'} documented."
+    if r["evidence_needed"]:
+        summary += f" {r['evidence_needed']}."
+    bullets = []
+    for quote, _client in entries[:3]:
+        words = quote.split()
+        bullets.append(" ".join(words[:PP_BULLET_WORDS]) + ("..." if len(words) > PP_BULLET_WORDS else ""))
+    return [summary, *bullets]
+
+
 def _matrix(doc: Document, matrix: dict) -> None:
     doc.add_heading("Compliance Matrix", 1)
     _table(
         doc,
         ["Requirement", "Type", "Gap", "Draft response"],
-        [[r["requirement"], r["requirement_type"], r["gap"], r["draft_response"]] for r in matrix["rows"]],
+        [[r["requirement"], r["requirement_type"], r["gap"], _pp_draft(r)] for r in matrix["rows"]],
+        MATRIX_WIDTHS,
     )
 
 

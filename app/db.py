@@ -104,6 +104,33 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        6,
+        """
+        CREATE TABLE matrix_rows_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            solicitation_id TEXT NOT NULL,
+            firm_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            requirement TEXT NOT NULL,
+            section_ref TEXT NOT NULL CHECK (section_ref IN ('C', 'L', 'M')),
+            firm_capability TEXT NOT NULL,
+            gap TEXT NOT NULL CHECK (gap IN ('none', 'partial', 'full')),
+            evidence_needed TEXT NOT NULL,
+            draft_response TEXT NOT NULL,
+            requirement_type TEXT NOT NULL DEFAULT 'capability'
+                CHECK (requirement_type IN ('capability', 'eligibility', 'submission', 'evaluation'))
+        );
+        INSERT INTO matrix_rows_new (id, created_at, solicitation_id, firm_id, position, requirement, section_ref,
+            firm_capability, gap, evidence_needed, draft_response, requirement_type)
+            SELECT id, created_at, solicitation_id, firm_id, position, requirement, section_ref,
+            firm_capability, gap, evidence_needed, draft_response, requirement_type FROM matrix_rows;
+        DROP TABLE matrix_rows;
+        ALTER TABLE matrix_rows_new RENAME TO matrix_rows;
+        CREATE INDEX idx_matrix_rows_sol_firm ON matrix_rows (solicitation_id, firm_id);
+        """,
+    ),
 ]
 
 

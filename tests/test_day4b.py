@@ -11,10 +11,11 @@ from app.main import app
 from app.routes import get_llm
 from app.seed import seed_firms
 from tests.test_agent import _final, _llm, _message, _response, _solicitation
-from tests.test_matrix import GOOD_ROWS, _matrix_final, _pp_none
+from tests.test_matrix import GOOD_ROWS, _matrix_final
 
 PP_ROW = {
     **GOOD_ROWS[2],
+    "section_ref": "L",
     "requirement": "Offerors shall provide three references for contracts of similar size and scope",
     "requirement_type": "submission",
     "firm_capability": matrix.NO_EVIDENCE,
@@ -131,7 +132,7 @@ def test_validator_rejects_submission_row_mentioning_past_performance():
 def _setup_matrix():
     seed_firms()
     sol_id = _solicitation()
-    llm, _ = _llm(_matrix_final("m", GOOD_ROWS), *_pp_none())
+    llm, _ = _llm(_matrix_final("m", GOOD_ROWS))
     matrix.run_matrix(1, sol_id, llm)
     return sol_id
 

@@ -21,11 +21,12 @@ MAX_TOKENS = 24000
 SECTION_CHARS = 15000
 SUMMARY_CHARS = 200
 READINESS_WEIGHT = {"none": 1.0, "partial": 0.5, "full": 0.0}
-REQUIREMENT_TYPES = ("capability", "eligibility", "submission")
+REQUIREMENT_TYPES = ("capability", "eligibility", "submission", "evaluation")
 SCORED_TYPES = ("capability", "eligibility")
 NO_EVIDENCE = "No matching evidence in profile."
 # Past-performance requirements are eligibility rows whose gap is computed in code, never submission rows.
-PAST_PERFORMANCE_RE = re.compile(r"past[\s-]+performance|references?|experience|similar\s+(?:in\s+)?(?:size|scope)", re.I)
+PAST_PERFORMANCE_RE = re.compile(r"past[\s-]+performance|references?|experience|similar\s+(?:in\s+)?(?:size|scope)", re.I)
+OFFICE_RE = re.compile(r"\boffices?\b", re.I)
 PP_NONE_MIN = 3  # verified matching entries needed for gap none; 1..2 is partial, 0 is full
 PP_MIN_TERMS = 2  # distinct scope terms an entry must match to count
 PP_MAX_TERMS = 8
@@ -55,13 +56,18 @@ RUBRIC = (
     "Rows: requirement (concise, one obligation); section_ref (C, L or M); "
     "requirement_type (capability = work the firm must be able to perform; eligibility = certifications, set-aside, NAICS, "
     "location, registrations, and any request for past performance, references, or experience of similar size or scope; "
-    "submission = format, page limits, volumes, deadlines, forms - never references or past performance); firm_capability; "
+    "submission = format, page limits, volumes, deadlines, forms - never references or past performance; "
+    "evaluation = Section M evaluation factors, subfactors, weights and their relative importance); firm_capability; "
     "gap (none = fully met by documented facts, partial = partly met or unproven, full = nothing documented); "
     "evidence_needed (what the firm must provide to close the gap; empty string when gap is none, except an eligibility "
     "requirement met by a quoted certification, where it holds only a verification action such as "
     "\"Confirm HUBZone status is active in SAM.gov before submission\"); draft_response.\n"
     "SUBMISSION ROWS: gap is always none, firm_capability is exactly \"" + NO_EVIDENCE + "\", evidence_needed is empty, and "
     "draft_response is a short action item (e.g. Prepare technical volume within 15 pages) with no capability claims.\n"
+    "EVALUATION ROWS follow the same rules: gap none, firm_capability exactly \"" + NO_EVIDENCE + "\", evidence_needed empty, "
+    "draft_response a short action item such as \"Weighting noted; structure the proposal to address it.\"\n"
+    "LOCAL PRESENCE: when a draft_response speaks of the firm's local presence, write \"Based in\" followed by the profile's "
+    "place_of_performance. Never use the word \"office\" unless the profile uses it.\n"
     "DRAFT_RESPONSE RULES for capability and eligibility rows:\n"
     "- gap none: may state the capability, using only facts quoted in firm_capability.\n"
     "- gap partial: draft only from quoted evidence and end with one sentence naming what still has to be supplied.\n"
@@ -87,7 +93,7 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 class MatrixRow(BaseModel):
     requirement: str
     section_ref: Literal["C", "L", "M"]
-    requirement_type: Literal["capability", "eligibility", "submission"]
+    requirement_type: Literal["capability", "eligibility", "submission", "evaluation"]
     firm_capability: str
     gap: Literal["none", "partial", "full"]
     evidence_needed: str
@@ -228,6 +234,11 @@ def assess_past_performance(firm: dict, sol: dict, llm: MetaClient) -> dict:
     return {"verified": verified, "size": size}
 
 
+def _is_pp_row(r: MatrixRow) -> bool:
+    """The row asking for references or experience; Section M evaluation rows only weigh it and are never matched."""
+    return r.section_ref != "M" and r.requirement_type != "evaluation" and bool(PAST_PERFORMANCE_RE.search(r.requirement))
+
+
 def apply_past_performance(rows: list[MatrixRow], pp: dict | None) -> list[MatrixRow]:
     """Force past-performance rows to eligibility and compute type, gap, evidence and draft from the assessment."""
     if pp is None:
@@ -257,7 +268,7 @@ def apply_past_performance(rows: list[MatrixRow], pp: dict | None) -> list[Matri
         r.model_copy(update={
             "requirement_type": "eligibility", "firm_capability": capability, "gap": gap,
             "evidence_needed": evidence, "draft_response": draft,
-        }) if PAST_PERFORMANCE_RE.search(r.requirement) else r
+        }) if _is_pp_row(r) else r
         for r in rows
     ]
 
@@ -290,6 +301,7 @@ def check_grounding(rows: list[MatrixRow], firm: dict) -> list[str]:
     for i, row in enumerate(rows, 1):
         label = f"row {i} ({row.requirement[:60]!r})"
         submission = row.requirement_type == "submission"
+        evaluation = row.requirement_type == "evaluation"
         quotes = _QUOTE_RE.findall(row.firm_capability)
         bad = [q for q in quotes if not any(_norm(q) in f for f in facts)]
         loose = _unquoted_sentences(row.firm_capability)
@@ -297,13 +309,21 @@ def check_grounding(rows: list[MatrixRow], firm: dict) -> list[str]:
             problems.append(f"{label} cites facts not in the firm profile: {bad}")
         elif loose:
             problems.append(f"{label} has firm_capability sentences with no verbatim quote (use exactly {NO_EVIDENCE!r}): {loose}")
-        elif row.gap == "none" and not submission and not quotes:
+        elif row.gap == "none" and not (submission or evaluation) and not quotes:
             problems.append(f"{label} has gap 'none' but quotes no documented fact")
+        if OFFICE_RE.search(row.draft_response) and not any("office" in f for f in facts):
+            problems.append(f"{label} uses the word 'office'; write 'Based in' plus the profile's place_of_performance instead")
         if submission:
             if PAST_PERFORMANCE_RE.search(row.requirement):
                 problems.append(f"{label} mentions references, past performance or experience, so requirement_type must be 'eligibility', not 'submission'")
             if row.gap != "none":
                 problems.append(f"{label} is a submission requirement, so gap must be 'none'")
+            continue
+        if evaluation:
+            if row.gap != "none":
+                problems.append(f"{label} is an evaluation factor, so gap must be 'none'")
+            if row.firm_capability != NO_EVIDENCE:
+                problems.append(f"{label} is an evaluation factor, so firm_capability must be exactly {NO_EVIDENCE!r}")
             continue
         if row.gap != "none" and not row.evidence_needed.strip():
             problems.append(f"{label} has a gap but empty evidence_needed")
@@ -374,7 +394,7 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         else:
             try:
                 rows = ModelMatrix.model_validate(res.parsed).rows
-                if pp is None and any(PAST_PERFORMANCE_RE.search(r.requirement) for r in rows):
+                if pp is None and any(_is_pp_row(r) for r in rows):
                     pp = assess_past_performance(firm, sol, llm)
                 rows = apply_past_performance(rows, pp)
                 problems = check_grounding(rows, firm) if rows else ["rows is empty"]
