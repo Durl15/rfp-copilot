@@ -131,6 +131,14 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX idx_matrix_rows_sol_firm ON matrix_rows (solicitation_id, firm_id);
         """,
     ),
+    (
+        7,
+        """
+        ALTER TABLE decisions ADD COLUMN verdict_source TEXT NOT NULL DEFAULT 'model'
+            CHECK (verdict_source IN ('model', 'rule'));
+        ALTER TABLE decisions ADD COLUMN rule_reason TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 

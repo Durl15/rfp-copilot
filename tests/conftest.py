@@ -1,6 +1,7 @@
 import pytest
 
 from app import db, seed
+from app.agent import go_no_go
 
 
 @pytest.fixture(autouse=True)
@@ -10,6 +11,18 @@ def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setattr(seed, "PRIVATE_PROFILE", tmp_path / "no_private_profile.json")
     db.init_db()
     return tmp_path / "test.sqlite3"
+
+
+def fake_pp(verified: int):
+    """Stand-in for matrix.assess_past_performance returning `verified` verified matches."""
+    entry = {"client": "C", "scope": "S", "verified": True}
+    return lambda firm, sol, llm: {"verified": [{"client": "C", "quote": "S", "entry": entry}] * verified, "size": ""}
+
+
+@pytest.fixture(autouse=True)
+def three_verified_matches(monkeypatch):
+    """Go/no-go tests that are not about the floor see enough matches to leave the model verdict alone."""
+    monkeypatch.setattr(go_no_go, "assess_past_performance", fake_pp(3))
 
 
 def rows(sql, params=()):

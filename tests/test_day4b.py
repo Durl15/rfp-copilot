@@ -138,7 +138,7 @@ def _setup_matrix():
 
 
 def _text(words: int, extra: str = "") -> str:
-    return ("Syracuse consulting " * words).strip() + extra
+    return ("Syracuse consulting " * (words // 2)).strip() + extra
 
 
 def test_narrative_saves_and_prompt_lists_full_gaps():

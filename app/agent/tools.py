@@ -121,12 +121,16 @@ def estimate_effort(gap_counts: dict[str, int]) -> dict:
     return {"hours": hours, "base_hours": BASE_HOURS}
 
 
-def record_decision(solicitation_id: str, firm_id: int, verdict: str, score: int, reasons: list[str]) -> dict:
+def record_decision(
+    solicitation_id: str, firm_id: int, verdict: str, score: int, reasons: list[str],
+    verdict_source: str = "model", rule_reason: str = "",
+) -> dict:
     with db.session() as conn:
         cur = conn.execute(
-            "INSERT INTO decisions (created_at, solicitation_id, firm_id, verdict, score, reasons)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.now(timezone.utc).isoformat(), solicitation_id, firm_id, verdict, score, json.dumps(reasons)),
+            "INSERT INTO decisions (created_at, solicitation_id, firm_id, verdict, score, reasons, verdict_source, rule_reason)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), solicitation_id, firm_id, verdict, score, json.dumps(reasons),
+             verdict_source, rule_reason),
         )
     return {"decision_id": cur.lastrowid}
 

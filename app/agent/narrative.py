@@ -1,6 +1,7 @@
-"""Firm narrative agent: a ~200-word narrative drawn only from the firm profile, never claiming a gap-full capability."""
+"""Firm narrative agent: a two-paragraph narrative drawn only from the firm data, never claiming a gap-full capability."""
 import json
 import logging
+import re
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -16,11 +17,17 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_TOKENS = 3000
-MIN_WORDS, MAX_WORDS = 120, 250
+MIN_WORDS, MAX_WORDS = 100, 190
+BANNED_PHRASES = ("the firm profile", "the profile", "according to")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 SYSTEM_PROMPT = (
-    "You write the firm narrative for a federal proposal. Write about 200 words of plain prose in one or two paragraphs. "
-    "Use ONLY facts in the firm profile and past performance provided. Never invent numbers, dollar amounts, clients, "
+    "You write the firm narrative for a federal proposal. Write exactly two short paragraphs of plain prose, 120 to 170 "
+    "words in total. Paragraph one: who the firm is, its size standard, HUBZone status, NAICS codes, and that it is based "
+    "in the place of performance. Paragraph two: what the firm does, drawn from the past-performance entries only, "
+    "described by function and audience. State each fact once; never repeat a sentence or restate a fact. "
+    "Never write the phrases \"the firm profile\", \"the profile\" or \"according to\"; write about the firm directly. "
+    "Use ONLY facts in the firm data and past performance provided. Never invent numbers, dollar amounts, clients, "
     "certifications or capabilities. Never claim, imply or hint at any capability listed under <gaps>. "
     "Past-performance entries with verified false: state only what the work does and who it is for. Never mention "
     "dates, dollar values, client retention, references, production status or demos for them. "
@@ -39,9 +46,14 @@ def _prompt(firm: dict, sol: dict, gaps: list[str]) -> str:
 def check_narrative(text: str, firm: dict) -> list[str]:
     problems = []
     problems.extend(claims.check_text(text, firm))
+    lowered = text.lower()
+    problems.extend(f"never write the phrase {p!r}" for p in BANNED_PHRASES if p in lowered)
+    sentences = [" ".join(s.lower().split()) for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if len(set(sentences)) < len(sentences):
+        problems.append("a sentence is repeated; state each fact once")
     words = len(text.split())
     if not MIN_WORDS <= words <= MAX_WORDS:
-        problems.append(f"narrative is {words} words; write about 200")
+        problems.append(f"narrative is {words} words; write two short paragraphs of 120 to 170 words")
     return problems
 
 
