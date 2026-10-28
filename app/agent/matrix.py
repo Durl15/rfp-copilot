@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 
 from app import db, firms, ingest
 from app.agent import tools
+from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
 
@@ -359,23 +360,22 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
     system = _system_prompt(firm)
     messages = [{"role": "user", "content": _user_message(sol)}]
     trace: list[dict] = []
-    previous_id = None
+    conv = Conversation(
+        llm,
+        system=system,
+        tools=MODEL_TOOLS,
+        json_schema=MATRIX_SCHEMA,
+        schema_name="compliance_matrix",
+        reasoning_effort="medium",
+        feature="matrix",
+        max_tokens=MAX_TOKENS,
+    )
     retried = False
     res = None
     problem = ""
     pp = None  # assessed once, only when a past-performance row appears, and reused across the retry
     for turn in range(MAX_TURNS):
-        res = llm.complete(
-            messages,
-            system=system,
-            tools=MODEL_TOOLS,
-            json_schema=MATRIX_SCHEMA,
-            schema_name="compliance_matrix",
-            reasoning_effort="medium",
-            feature="matrix",
-            max_tokens=MAX_TOKENS,
-            previous_response_id=previous_id,
-        )
+        res = conv.send(messages)
         log.debug("turn=%d tools=%s usage=%s", turn, [c["name"] for c in res.tool_calls], res.usage)
         if res.tool_calls:
             outputs = []
@@ -386,7 +386,7 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
                     result = {"error": str(exc)}
                 trace.append({"tool": call["name"], "args": call["arguments"], "result_summary": _summary(result)})
                 outputs.append({"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result, default=str)})
-            messages, previous_id = outputs, res.response_id
+            messages = outputs
             continue
         problems: list[str] = []
         if res.parsed is None:
@@ -414,7 +414,6 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             "profile (otherwise use gap partial or full and say what evidence is needed), following the SUBMISSION ROWS and "
             "DRAFT_RESPONSE RULES, and return the full matrix JSON.",
         }]
-        previous_id = res.response_id
     last = res.text[:500] if res else ""
     raise RuntimeError(
         f"matrix did not produce a valid answer ({problem or 'tool calls never stopped'});"

@@ -7,6 +7,7 @@ from pydantic import BaseModel, ValidationError
 
 from app import firms, ingest
 from app.agent import artifacts
+from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
 
@@ -61,12 +62,13 @@ def run_capability(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         raise LookupError("firm or solicitation not found")
     profile = json.dumps(firm, sort_keys=True, default=str)
     messages = [{"role": "user", "content": f"<firm_profile>\n{profile}\n</firm_profile>\nWrite the capability statement."}]
-    previous_id, problem = None, ""
+    conv = Conversation(
+        llm, system=SYSTEM_PROMPT, json_schema=STATEMENT_SCHEMA, schema_name="capability_statement",
+        reasoning_effort="low", feature="capability", max_tokens=MAX_TOKENS,
+    )
+    problem = ""
     for _ in range(2):
-        res = llm.complete(
-            messages, system=SYSTEM_PROMPT, json_schema=STATEMENT_SCHEMA, schema_name="capability_statement",
-            reasoning_effort="low", feature="capability", max_tokens=MAX_TOKENS, previous_response_id=previous_id,
-        )
+        res = conv.send(messages)
         try:
             if res.parsed is None:
                 raise ValueError(res.parse_error or "no JSON answer returned")
@@ -83,7 +85,6 @@ def run_capability(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         except ValueError as exc:  # pydantic ValidationError is a ValueError
             problem = str(exc)
         messages = [{"role": "user", "content": "Rejected: " + problem + ". Use only profile facts and return the JSON."}]
-        previous_id = res.response_id
     raise RuntimeError(f"capability statement did not pass validation ({problem[:300]})")
 
 

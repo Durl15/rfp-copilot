@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app import firms, ingest
 from app.agent import artifacts
 from app.agent.matrix import load_matrix
+from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
 
@@ -53,19 +54,16 @@ def run_narrative(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         raise LookupError("no matrix for this firm and solicitation; run /agent/matrix first")
     gaps = [r["requirement"] for r in matrix["rows"] if r["gap"] == "full" and r["requirement_type"] != "submission"]
     messages = [{"role": "user", "content": _prompt(firm, sol, gaps)}]
-    previous_id, problems = None, []
+    conv = Conversation(llm, system=SYSTEM_PROMPT, reasoning_effort="minimal", feature="narrative", max_tokens=MAX_TOKENS)
+    problems = []
     for _ in range(2):
-        res = llm.complete(
-            messages, system=SYSTEM_PROMPT, reasoning_effort="minimal", feature="narrative",
-            max_tokens=MAX_TOKENS, previous_response_id=previous_id,
-        )
+        res = conv.send(messages)
         text = res.text.strip()
         problems = check_narrative(text, firm) if text else ["empty answer"]
         if not problems:
             artifacts.save_artifact(solicitation_id, firm_id, "narrative", text)
             return {"narrative": text}
         messages = [{"role": "user", "content": "Rejected: " + "; ".join(problems) + ". Rewrite using only profile facts."}]
-        previous_id = res.response_id
     raise RuntimeError(f"narrative did not pass validation ({'; '.join(problems)})")
 
 

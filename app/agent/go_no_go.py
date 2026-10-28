@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app import firms, ingest
 from app.agent import tools
+from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
 
@@ -85,21 +86,20 @@ def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         }
     ]
     trace: list[dict] = []
-    previous_id = None
+    conv = Conversation(
+        llm,
+        system=SYSTEM_PROMPT,
+        tools=MODEL_TOOLS,
+        json_schema=GO_NO_GO_SCHEMA,
+        schema_name="go_no_go",
+        reasoning_effort="high",
+        feature="go_no_go",
+        max_tokens=MAX_TOKENS,
+    )
     res = None
     problem = ""
     for turn in range(MAX_TURNS):
-        res = llm.complete(
-            messages,
-            system=SYSTEM_PROMPT,
-            tools=MODEL_TOOLS,
-            json_schema=GO_NO_GO_SCHEMA,
-            schema_name="go_no_go",
-            reasoning_effort="high",
-            feature="go_no_go",
-            max_tokens=MAX_TOKENS,
-            previous_response_id=previous_id,
-        )
+        res = conv.send(messages)
         log.debug(
             "turn=%d tools=%s output_types=%s usage=%s",
             turn, [c["name"] for c in res.tool_calls], res.output_types, res.usage,
@@ -124,7 +124,7 @@ def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
                 result = {"error": str(exc)}
             trace.append({"tool": call["name"], "args": call["arguments"], "result_summary": _summary(result)})
             outputs.append({"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result, default=str)})
-        messages, previous_id = outputs, res.response_id
+        messages = outputs
     last = res.text[:500] if res else ""
     raise RuntimeError(
         f"go/no-go did not produce a valid answer within {MAX_TURNS} model turns"

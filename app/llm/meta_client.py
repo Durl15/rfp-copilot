@@ -58,6 +58,13 @@ def _retryable(exc: Exception) -> bool:
     return isinstance(exc, openai.APIStatusError) and (exc.status_code == 429 or exc.status_code >= 500)
 
 
+def _response_missing(exc: Exception) -> bool:
+    if not isinstance(exc, openai.BadRequestError):
+        return False
+    msg = str(exc).lower()
+    return "referenced response not found" in msg or "expired" in msg
+
+
 class MetaClient:
     def __init__(self, settings: Settings | None = None, client: openai.OpenAI | None = None, sleep=time.sleep):
         self.settings = settings or get_settings()
@@ -83,6 +90,7 @@ class MetaClient:
             "input": messages,
             "reasoning": {"effort": reasoning_effort},
             "max_output_tokens": max_tokens,
+            "store": True,
         }
         if system:
             params["instructions"] = system
@@ -128,14 +136,27 @@ class MetaClient:
                 self._sleep(BACKOFF_BASE_S * 2 ** (attempt - 1))
 
     def _create_response(
-        self, messages, system, tools, json_schema, schema_name, reasoning_effort, feature, max_tokens, previous_response_id
+        self, messages, system, tools, json_schema, schema_name, reasoning_effort, feature, max_tokens,
+        previous_response_id, fallback_input=None,
     ):
         params = self._params(
             messages, system, tools, json_schema, schema_name, reasoning_effort, max_tokens, previous_response_id
         )
         started = time.monotonic()
         try:
-            resp = self._with_retry(lambda: self._client.responses.create(**params))
+            try:
+                resp = self._with_retry(lambda: self._client.responses.create(**params))
+            except Exception as exc:
+                if not (previous_response_id and fallback_input is not None and _response_missing(exc)):
+                    raise
+                log.warning(
+                    "previous_response_id %s not found or expired (%s); retrying statelessly with %d input items",
+                    previous_response_id, feature, len(fallback_input),
+                )
+                params = self._params(
+                    fallback_input, system, tools, json_schema, schema_name, reasoning_effort, max_tokens, None
+                )
+                resp = self._with_retry(lambda: self._client.responses.create(**params))
         except Exception as exc:
             self._log(feature, started, None, exc)
             raise
@@ -160,9 +181,12 @@ class MetaClient:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         schema_name: str = "output",
         previous_response_id: str | None = None,
+        fallback_input: list | None = None,
     ) -> LLMResult:
+        """fallback_input: the full local item list, resent without previous_response_id if that id is missing or expired."""
         resp = self._create_response(
-            messages, system, tools, json_schema, schema_name, reasoning_effort, feature, max_tokens, previous_response_id
+            messages, system, tools, json_schema, schema_name, reasoning_effort, feature, max_tokens,
+            previous_response_id, fallback_input,
         )
         status = getattr(resp, "status", None)
         incomplete = getattr(resp, "incomplete_details", None)
@@ -174,7 +198,8 @@ class MetaClient:
                 resp.id, max_tokens, reasoning_effort, retry_tokens, retry_effort,
             )
             resp = self._create_response(
-                messages, system, tools, json_schema, schema_name, retry_effort, feature, retry_tokens, previous_response_id
+                messages, system, tools, json_schema, schema_name, retry_effort, feature, retry_tokens,
+                previous_response_id, fallback_input,
             )
             status = getattr(resp, "status", None)
         if status != "completed":
