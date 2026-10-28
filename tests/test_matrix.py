@@ -48,12 +48,19 @@ def _matrix_final(rid, matrix_rows):
     return _final(rid, {"rows": matrix_rows})
 
 
+def _pp_none():
+    """Scripted past-performance calls for the 3 seed entries when nothing matches: scope extraction, then one per entry."""
+    no_match = {"relevant": False, "matched_terms": [], "quote": ""}
+    return [_final("s", {"terms": ["help desk", "ITSM migration"], "size_indicator": ""}), *[_final("m", no_match)] * 3]
+
+
 def test_matrix_parse_gap_counts_and_persistence():
     seed_firms()
     sol_id = _solicitation()
     llm, sdk = _llm(
         _tool_turn("r1", ("c1", "search_past_performance", {"firm_id": 1, "keywords": ["modernization"]})),
         _matrix_final("r2", GOOD_ROWS),
+        *_pp_none(),
     )
     out = matrix.run_matrix(1, sol_id, llm)
 
@@ -64,7 +71,7 @@ def test_matrix_parse_gap_counts_and_persistence():
     }
     assert [r["section_ref"] for r in out["matrix"]["rows"]] == ["C", "L", "M"]
     assert [t["tool"] for t in out["trace"]] == ["search_past_performance"]
-    assert all(c["reasoning"] == {"effort": "medium"} and c["max_output_tokens"] == 24000 for c in sdk.calls)
+    assert all(c["reasoning"] == {"effort": "medium"} and c["max_output_tokens"] == 24000 for c in sdk.calls[:2])
     assert {t["name"] for t in sdk.calls[0]["tools"]} == {"get_solicitation", "search_past_performance", "lookup_naics"}
     saved = rows("SELECT solicitation_id, firm_id, gap FROM matrix_rows ORDER BY position")
     assert [(r["solicitation_id"], r["firm_id"], r["gap"]) for r in saved] == [
@@ -78,10 +85,10 @@ def test_matrix_parse_gap_counts_and_persistence():
 def test_firm_profile_is_in_stable_prefix_and_identical_across_solicitations():
     seed_firms()
     a, b = _solicitation(), _solicitation()
-    llm, sdk = _llm(_matrix_final("r1", GOOD_ROWS), _matrix_final("r2", GOOD_ROWS))
+    llm, sdk = _llm(_matrix_final("r1", GOOD_ROWS), *_pp_none(), _matrix_final("r2", GOOD_ROWS), *_pp_none())
     matrix.run_matrix(1, a, llm)
     matrix.run_matrix(1, b, llm)
-    first, second = (c["instructions"] for c in sdk.calls)
+    first, second = (c["instructions"] for c in sdk.calls if c["instructions"].startswith("You build"))
     assert first == second and "DJ AI Business Consultant LLC" in first and "GROUNDING RULES" in first
     assert a in sdk.calls[0]["input"][0]["content"] and a not in first
 
@@ -89,7 +96,7 @@ def test_firm_profile_is_in_stable_prefix_and_identical_across_solicitations():
 def test_rerun_replaces_rows():
     seed_firms()
     sol_id = _solicitation()
-    llm, _ = _llm(_matrix_final("r1", GOOD_ROWS), _matrix_final("r2", GOOD_ROWS[:2]))
+    llm, _ = _llm(_matrix_final("r1", GOOD_ROWS), *_pp_none(), _matrix_final("r2", GOOD_ROWS[:2]))
     matrix.run_matrix(1, sol_id, llm)
     matrix.run_matrix(1, sol_id, llm)
     assert len(rows("SELECT id FROM matrix_rows")) == 2
@@ -98,11 +105,11 @@ def test_rerun_replaces_rows():
 def test_invented_capability_is_rejected_and_retried_once():
     seed_firms()
     sol_id = _solicitation()
-    llm, sdk = _llm(_matrix_final("r1", [BAD_ROW, *GOOD_ROWS[1:]]), _matrix_final("r2", GOOD_ROWS))
+    llm, sdk = _llm(_matrix_final("r1", [BAD_ROW, *GOOD_ROWS[1:]]), *_pp_none(), _matrix_final("r2", GOOD_ROWS))
     out = matrix.run_matrix(1, sol_id, llm)
 
-    assert len(sdk.calls) == 2 and sdk.calls[1]["previous_response_id"] == "r1"
-    feedback = sdk.calls[1]["input"][0]["content"]
+    assert len(sdk.calls) == 6 and sdk.calls[5]["previous_response_id"] == "r1"
+    feedback = sdk.calls[5]["input"][0]["content"]
     assert "rejected" in feedback and "TS/SCI facility clearance" in feedback
     assert out["matrix"]["summary"]["counts"]["none"] == 1
 
@@ -121,7 +128,7 @@ def test_gap_none_without_quoted_fact_is_rejected_and_second_failure_raises():
 def test_matrix_endpoints():
     seed_firms()
     sol_id = _solicitation()
-    llm, _ = _llm(_matrix_final("r1", GOOD_ROWS))
+    llm, _ = _llm(_matrix_final("r1", GOOD_ROWS), *_pp_none())
     app.dependency_overrides[get_llm] = lambda: llm
     try:
         client = TestClient(app)
@@ -141,9 +148,9 @@ def test_cached_tokens_logged():
     sol_id = _solicitation()
     resp = _matrix_final("r1", GOOD_ROWS)
     resp.usage.input_tokens_details = type("D", (), {"cached_tokens": 1234})()
-    llm, _ = _llm(resp)
+    llm, _ = _llm(resp, *_pp_none())
     matrix.run_matrix(1, sol_id, llm)
-    assert rows("SELECT feature, cached_tokens FROM llm_calls") == [{"feature": "matrix", "cached_tokens": 1234}]
+    assert rows("SELECT feature, cached_tokens FROM llm_calls WHERE feature = 'matrix'") == [{"feature": "matrix", "cached_tokens": 1234}]
 
 
 def _row(**over):
@@ -166,9 +173,9 @@ def test_full_gap_draft_starting_we_will_is_rejected_and_retried():
     seed_firms()
     sol_id = _solicitation()
     bad = {**GOOD_ROWS[2], "requirement": "Contractor shall provide a 24/7 help desk", "draft_response": "We will deliver this capability."}
-    llm, sdk = _llm(_matrix_final("r1", [bad]), _matrix_final("r2", GOOD_ROWS))
+    llm, sdk = _llm(_matrix_final("r1", [bad]), _matrix_final("r2", GOOD_ROWS), *_pp_none())
     matrix.run_matrix(1, sol_id, llm)
-    assert len(sdk.calls) == 2 and "must begin with 'Gap:'" in sdk.calls[1]["input"][0]["content"]
+    assert "must begin with 'Gap:'" in sdk.calls[1]["input"][0]["content"]
     assert _problems(_row(**{**GOOD_ROWS[2], "draft_response": "Gap: nothing documented."})) == []
     assert _problems(_row(**{**GOOD_ROWS[2], "draft_response": "Nothing documented."}))
 
@@ -193,8 +200,9 @@ def test_matrix_retries_once_on_max_output_tokens():
     llm, sdk = _llm(
         _response("r1", status="incomplete", incomplete_reason="max_output_tokens"),
         _matrix_final("r2", GOOD_ROWS),
+        *_pp_none(),
     )
     out = matrix.run_matrix(1, sol_id, llm)
 
     assert len(out["matrix"]["rows"]) == 3
-    assert [(c["reasoning"]["effort"], c["max_output_tokens"]) for c in sdk.calls] == [("medium", 24000), ("low", 48000)]
+    assert [(c["reasoning"]["effort"], c["max_output_tokens"]) for c in sdk.calls[:2]] == [("medium", 24000), ("low", 48000)]

@@ -55,6 +55,14 @@ GAP_HOURS = {
 }
 DEFAULT_GAP_HOURS = 8
 
+# Generic solicitation words that match almost any past-performance entry; never valid search keywords.
+STOPWORDS = frozenset(
+    "shall will must that this with from have been their they them than then which where when "
+    "provide provided providing contractor contract offeror government agency county services service "
+    "work include including required requirements requirement under such each other into also "
+    "support perform performance using used personnel period section task tasks system systems management".split()
+)
+
 
 class ToolError(ValueError):
     """Unknown tool or invalid arguments. The message is safe to return to the model."""
@@ -89,7 +97,7 @@ def search_past_performance(firm_id: int, keywords: list[str]) -> dict:
     firm = firms.get_firm(firm_id)
     if not firm:
         return {"error": f"firm {firm_id} not found"}
-    kws = [k.lower() for k in keywords]
+    kws = [k for k in (k.lower().strip() for k in keywords) if k and k not in STOPWORDS]
     matches = []
     for entry in firm["past_performance"]:
         haystack = " ".join(str(v) for v in entry.values()).lower()

@@ -2,7 +2,6 @@
 import json
 import logging
 import re
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -27,13 +26,23 @@ SCORED_TYPES = ("capability", "eligibility")
 NO_EVIDENCE = "No matching evidence in profile."
 # Past-performance requirements are eligibility rows whose gap is computed in code, never submission rows.
 PAST_PERFORMANCE_RE = re.compile(r"past[\s-]+performance|references?|experience|similar\s+(?:in\s+)?(?:size|scope)", re.I)
-PP_NONE_MIN = 3  # matching entries needed for gap none; 1..2 is partial, 0 is full
-PP_KEYWORDS = 10
-_STOPWORDS = frozenset(
-    "shall will must that this with from have been their they them than then which where when "
-    "provide provided providing contractor contract offeror government agency services service "
-    "work include including required requirements requirement under such each other into also "
-    "support perform performance using used personnel period section task tasks".split()
+PP_NONE_MIN = 3  # verified matching entries needed for gap none; 1..2 is partial, 0 is full
+PP_MIN_TERMS = 2  # distinct scope terms an entry must match to count
+PP_MAX_TERMS = 8
+PP_SIZE_RATIO = 0.5  # an entry shows comparable size if it has a number at least this fraction of the solicitation's
+PP_SCOPE_TOKENS = 1000
+PP_MATCH_TOKENS = 600
+SCOPE_PROMPT = (
+    "You read the scope of one federal solicitation. terms: 4 to 8 specific scope terms naming the work, technology or "
+    "deliverables, e.g. \"help desk\", \"ITSM migration\", \"SLA reporting\", \"end-user training\". Never use generic words "
+    "such as services, system, provide, contractor, county, support, management. size_indicator: the stated size of the "
+    "work, e.g. \"1,200 users\", or an empty string if none is stated. Reply with the JSON only."
+)
+MATCH_PROMPT = (
+    "You compare one past-performance entry of a firm to the scope terms of a solicitation. relevant: true only if the "
+    "entry shows work matching at least 2 of the terms. matched_terms: those terms, copied exactly from the list. "
+    "quote: one passage copied character for character from the entry that shows the match, or an empty string if "
+    "not relevant. Reply with the JSON only."
 )
 # The firm profile is already in the system prompt; the model only needs the solicitation and search tools.
 MODEL_TOOLS = [d for d in tools.TOOL_DEFINITIONS if d["name"] in ("get_solicitation", "search_past_performance", "lookup_naics")]
@@ -89,6 +98,35 @@ class ModelMatrix(BaseModel):
     rows: list[MatrixRow]
 
 
+class ScopeTerms(BaseModel):
+    terms: list[str]
+    size_indicator: str
+
+
+class EntryMatch(BaseModel):
+    relevant: bool
+    matched_terms: list[str]
+    quote: str
+
+
+SCOPE_SCHEMA = {
+    "type": "object",
+    "properties": {"terms": {"type": "array", "items": {"type": "string"}}, "size_indicator": {"type": "string"}},
+    "required": list(ScopeTerms.model_fields),
+    "additionalProperties": False,
+}
+MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "relevant": {"type": "boolean"},
+        "matched_terms": {"type": "array", "items": {"type": "string"}},
+        "quote": {"type": "string"},
+    },
+    "required": list(EntryMatch.model_fields),
+    "additionalProperties": False,
+}
+
+
 class Summary(BaseModel):
     counts: dict[str, int]
     counts_by_type: dict[str, int]
@@ -135,22 +173,79 @@ def summarize(rows: list[MatrixRow]) -> Summary:
     return Summary(counts=counts, counts_by_type=counts_by_type, overall_readiness_pct=pct)
 
 
-def _scope_keywords(sol: dict) -> list[str]:
-    """Most frequent content words of Section C (title when there is no Section C), for matching past performance."""
-    words = re.findall(r"[a-z]{4,}", (sol["section_c"] or sol["title"] or "").lower())
-    return [w for w, _ in Counter(w for w in words if w not in _STOPWORDS).most_common(PP_KEYWORDS)]
+def _ask(llm: MetaClient, system: str, user: str, schema: dict, model: type[BaseModel], feature: str, max_tokens: int):
+    res = llm.complete(
+        [{"role": "user", "content": user}], system=system, json_schema=schema, schema_name=feature,
+        reasoning_effort="minimal", feature=feature, max_tokens=max_tokens,
+    )
+    if res.parsed is None:
+        raise ValueError(res.parse_error or "no JSON answer returned")
+    return model.model_validate(res.parsed)  # ValidationError is a ValueError
 
 
-def apply_past_performance(rows: list[MatrixRow], firm_id: int, sol: dict) -> list[MatrixRow]:
-    """Force past-performance rows to eligibility and compute type, gap, evidence and draft from the firm's entries."""
-    keywords = _scope_keywords(sol)
-    matches = tools.search_past_performance(firm_id, keywords)["matches"] if keywords else []
-    quoted = [f'"{m["scope"]}" for "{m["client"]}".' for m in matches]
-    n = len(matches)
+def extract_scope(sol: dict, llm: MetaClient) -> tuple[list[str], str]:
+    """Specific scope terms (generic words dropped in code) and the size indicator, from Section C (title as fallback)."""
+    text = (sol["section_c"] or sol["title"] or "")[:SECTION_CHARS]
+    try:
+        out = _ask(llm, SCOPE_PROMPT, text, SCOPE_SCHEMA, ScopeTerms, "pp_scope", PP_SCOPE_TOKENS)
+    except ValueError as exc:
+        raise RuntimeError(f"past-performance scope extraction failed: {exc}")
+    terms: list[str] = []
+    for term in (" ".join(t.split()) for t in out.terms):
+        words = re.findall(r"[a-z0-9]+", term.lower())
+        if words and not all(w in tools.STOPWORDS for w in words) and term.lower() not in [t.lower() for t in terms]:
+            terms.append(term)
+    return terms[:PP_MAX_TERMS], out.size_indicator.strip()
+
+
+def _numbers(text: str) -> list[float]:
+    found = re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", text)
+    return [float(n.replace(",", "")) for n in found if not re.fullmatch(r"(?:19|20)\d\d", n)]  # skip years
+
+
+def _size_comparable(size: str, verified: list[dict]) -> bool:
+    wanted = max(_numbers(size), default=None)
+    if wanted is None:
+        return False
+    return any(n >= PP_SIZE_RATIO * wanted for m in verified for n in _numbers(" ".join(map(str, m["entry"].values()))))
+
+
+def assess_past_performance(firm: dict, sol: dict, llm: MetaClient) -> dict:
+    """Entries that match >= 2 scope terms with a quote verified verbatim in the entry; everything else is no match."""
+    terms, size = extract_scope(sol, llm)
+    wanted = {t.lower() for t in terms}
+    verified = []
+    for entry in firm["past_performance"]:
+        user = f"scope terms: {json.dumps(terms)}\n\nentry:\n{json.dumps(entry, default=str)}"
+        try:
+            m = _ask(llm, MATCH_PROMPT, user, MATCH_SCHEMA, EntryMatch, "pp_match", PP_MATCH_TOKENS)
+        except ValueError:
+            continue
+        hits = {t.lower() for t in m.matched_terms} & wanted
+        real = m.quote.strip() and '"' not in m.quote and any(m.quote in str(v) for v in entry.values())
+        if m.relevant and len(hits) >= PP_MIN_TERMS and real:
+            verified.append({"client": entry.get("client"), "quote": m.quote, "entry": entry})
+    return {"verified": verified, "size": size}
+
+
+def apply_past_performance(rows: list[MatrixRow], pp: dict | None) -> list[MatrixRow]:
+    """Force past-performance rows to eligibility and compute type, gap, evidence and draft from the assessment."""
+    if pp is None:
+        return rows
+    verified, size = pp["verified"], pp["size"]
+    quoted = [f'"{m["quote"]}" for "{m["client"]}".' if m["client"] else f'"{m["quote"]}".' for m in verified]
+    n = len(verified)
     gap = "none" if n >= PP_NONE_MIN else "partial" if n else "full"
+    undersized = gap == "none" and bool(size) and not _size_comparable(size, verified)
+    if undersized:
+        gap = "partial"
     capability = " ".join(quoted) or NO_EVIDENCE
     if gap == "none":
         evidence, draft = "", "Past performance of similar scope is documented: " + " ".join(quoted)
+    elif undersized:
+        evidence = f"Provide a past-performance reference of comparable size ({size})"
+        draft = ("Documented similar-scope past performance: " + " ".join(quoted)
+                 + f" Still to supply: a reference of comparable size ({size}).")
     elif gap == "partial":
         evidence = f"Provide {PP_NONE_MIN - n} more past-performance reference(s) of similar size and scope"
         draft = ("Documented similar-scope past performance: " + " ".join(quoted)
@@ -248,6 +343,7 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
     retried = False
     res = None
     problem = ""
+    pp = None  # assessed once, only when a past-performance row appears, and reused across the retry
     for turn in range(MAX_TURNS):
         res = llm.complete(
             messages,
@@ -277,7 +373,10 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             problems = [res.parse_error or "no JSON answer returned"]
         else:
             try:
-                rows = apply_past_performance(ModelMatrix.model_validate(res.parsed).rows, firm_id, sol)
+                rows = ModelMatrix.model_validate(res.parsed).rows
+                if pp is None and any(PAST_PERFORMANCE_RE.search(r.requirement) for r in rows):
+                    pp = assess_past_performance(firm, sol, llm)
+                rows = apply_past_performance(rows, pp)
                 problems = check_grounding(rows, firm) if rows else ["rows is empty"]
             except ValidationError as exc:
                 problems = [f"answer failed validation: {exc.error_count()} error(s)"]

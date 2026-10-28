@@ -6,12 +6,12 @@ from docx import Document
 from fastapi.testclient import TestClient
 
 from app import db, firms
-from app.agent import artifacts, capability, matrix, narrative
+from app.agent import artifacts, capability, matrix, narrative, tools
 from app.main import app
 from app.routes import get_llm
 from app.seed import seed_firms
 from tests.test_agent import _final, _llm, _message, _response, _solicitation
-from tests.test_matrix import GOOD_ROWS, _matrix_final
+from tests.test_matrix import GOOD_ROWS, _matrix_final, _pp_none
 
 PP_ROW = {
     **GOOD_ROWS[2],
@@ -22,37 +22,100 @@ PP_ROW = {
 }
 
 
-def _pp_firm(n_matches: int) -> None:
-    """Give firm 1 three past-performance entries, the first n_matches of which match 'software'."""
-    pp = [
-        {"client": f"C{i}", "scope": "software modernization work" if i < n_matches else "janitorial", "dates": "2024"}
-        for i in range(3)
-    ]
+HELP_DESK_SOL = {"section_c": "The contractor shall provide help desk support and ITSM migration.", "title": "t"}
+HELP_DESK_ENTRIES = [
+    {"client": f"County {i}", "scope": f"Help desk operation and ITSM migration for county agency {i}", "dates": "2024"}
+    for i in range(3)
+]
+
+
+def _set_pp(entries: list[dict]) -> None:
     with db.session() as conn:
-        conn.execute("UPDATE firms SET past_performance = ? WHERE id = 1", (json.dumps(pp),))
+        conn.execute("UPDATE firms SET past_performance = ? WHERE id = 1", (json.dumps(entries),))
 
 
-@pytest.mark.parametrize("n,gap", [(0, "full"), (1, "partial"), (2, "partial"), (3, "none")])
-def test_past_performance_row_is_eligibility_with_computed_gap(n, gap):
-    seed_firms()
-    _pp_firm(n)
+def _scope(size: str = ""):
+    return _final("s", {"terms": ["help desk", "ITSM migration", "SLA reporting"], "size_indicator": size})
+
+
+def _match(relevant=True, terms=("help desk", "ITSM migration"), quote=""):
+    return _final("m", {"relevant": relevant, "matched_terms": list(terms), "quote": quote})
+
+
+def _assess(llm, sol=HELP_DESK_SOL):
     row = matrix.MatrixRow.model_validate(PP_ROW)
-    sol = {"section_c": "The contractor shall deliver software modernization.", "title": "t"}
-    [out] = matrix.apply_past_performance([row], 1, sol)
-    assert out.requirement_type == "eligibility" and out.gap == gap
-    if n:
-        assert out.firm_capability.count('"software modernization work"') == n
-    else:
-        assert out.firm_capability == matrix.NO_EVIDENCE
+    pp = matrix.assess_past_performance(firms.get_firm(1), sol, llm)
+    [out] = matrix.apply_past_performance([row], pp)
     assert matrix.check_grounding([out], firms.get_firm(1)) == []
-    if gap == "full":
-        assert out.draft_response.startswith("Gap:")
+    return out
+
+
+def test_seed_profile_against_help_desk_solicitation_is_full():
+    seed_firms()
+    llm, sdk = _llm(_scope(), *[_match(False, (), "") for _ in range(3)])
+    out = _assess(llm)
+    assert (out.requirement_type, out.gap, out.firm_capability) == ("eligibility", "full", matrix.NO_EVIDENCE)
+    assert out.draft_response.startswith("Gap:")
+    assert all(c["reasoning"] == {"effort": "minimal"} for c in sdk.calls) and len(sdk.calls) == 4
+
+
+def test_fabricated_quote_is_rejected():
+    seed_firms()
+    fake = _match(True, ("help desk", "ITSM migration"), "Help desk operation and ITSM migration")
+    out = _assess(_llm(_scope(), fake, fake, fake)[0])
+    assert (out.gap, out.firm_capability) == ("full", matrix.NO_EVIDENCE)
+
+
+def test_single_term_match_is_rejected():
+    seed_firms()
+    _set_pp(HELP_DESK_ENTRIES)
+    one = [_match(True, ("help desk",), e["scope"]) for e in HELP_DESK_ENTRIES]
+    assert _assess(_llm(_scope(), *one)[0]).gap == "full"
+
+
+def test_three_help_desk_entries_yield_none():
+    seed_firms()
+    _set_pp(HELP_DESK_ENTRIES)
+    out = _assess(_llm(_scope(), *[_match(quote=e["scope"]) for e in HELP_DESK_ENTRIES])[0])
+    assert out.gap == "none" and out.evidence_needed == ""
+    assert all(f'"{e["scope"]}"' in out.firm_capability for e in HELP_DESK_ENTRIES)
+
+
+@pytest.mark.parametrize("n,gap", [(1, "partial"), (2, "partial")])
+def test_one_or_two_verified_matches_are_partial(n, gap):
+    seed_firms()
+    _set_pp(HELP_DESK_ENTRIES)
+    ms = [_match(quote=e["scope"]) if i < n else _match(False, (), "") for i, e in enumerate(HELP_DESK_ENTRIES)]
+    assert _assess(_llm(_scope(), *ms)[0]).gap == gap
+
+
+def test_size_indicator_downgrades_none_unless_an_entry_is_comparable():
+    seed_firms()
+    _set_pp(HELP_DESK_ENTRIES)
+    ms = [_match(quote=e["scope"]) for e in HELP_DESK_ENTRIES]
+    out = _assess(_llm(_scope("1,200 users"), *ms)[0])
+    assert out.gap == "partial" and "comparable size (1,200 users)" in out.evidence_needed
+    big = [{**e, "scope": e["scope"] + " serving 1,500 users"} for e in HELP_DESK_ENTRIES]
+    _set_pp(big)
+    ms = [_match(quote=e["scope"]) for e in big]
+    assert _assess(_llm(_scope("1,200 users"), *ms)[0]).gap == "none"
+
+
+def test_scope_extraction_drops_generic_terms():
+    terms = {"terms": ["services", "County support", "help desk", "Help Desk", "system"], "size_indicator": " "}
+    assert matrix.extract_scope(HELP_DESK_SOL, _llm(_final("s", terms))[0]) == (["help desk"], "")
+
+
+def test_stopwords_never_reach_the_search():
+    seed_firms()
+    assert tools.search_past_performance(1, ["services", "System", "county", "management"])["matches"] == []
+    [hit] = tools.search_past_performance(1, ["system", "grant"])["matches"]
+    assert hit["matched_keywords"] == ["grant"]
 
 
 def test_run_matrix_overrides_model_gap_for_past_performance_row():
     seed_firms()
-    _pp_firm(0)
-    llm, _ = _llm(_matrix_final("r1", [PP_ROW]))
+    llm, _ = _llm(_matrix_final("r1", [PP_ROW]), _scope(), *[_match(False, (), "") for _ in range(3)])
     out = matrix.run_matrix(1, _solicitation(), llm)
     row = out["matrix"]["rows"][0]
     assert (row["requirement_type"], row["gap"]) == ("eligibility", "full")
@@ -68,7 +131,7 @@ def test_validator_rejects_submission_row_mentioning_past_performance():
 def _setup_matrix():
     seed_firms()
     sol_id = _solicitation()
-    llm, _ = _llm(_matrix_final("m", GOOD_ROWS))
+    llm, _ = _llm(_matrix_final("m", GOOD_ROWS), *_pp_none())
     matrix.run_matrix(1, sol_id, llm)
     return sol_id
 
