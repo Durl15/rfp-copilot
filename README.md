@@ -53,6 +53,9 @@ Port 8003 avoids the usual 8000–8002 collisions on the dev machine. Migrations
 | `CIVICPROCUREBOT_API_KEY` | – | Sent as `X-API-Key` (assumed header; see `app/shortlist.py`) |
 | `SAM_API_KEY` | – | Only for `sam_notice_id` ingestion |
 | `DB_PATH` | `data/rfp_copilot.sqlite3` | SQLite file (local dev) |
+| `COPILOT_ADMIN_KEY` | – | Required `X-API-Key` for `POST /agent/run-daily`; blank means the endpoint rejects everything |
+| `MAX_RUN_INPUT_TOKENS` | `60000` | Token guard: a run whose first-call input exceeds this stops with `step_failed` |
+| `PRICE_IN_PER_MTOK` / `PRICE_OUT_PER_MTOK` | `0.50` / `2.00` | USD per million tokens for `est_cost_usd`. Assumed rates: set Meta's actual pricing |
 
 Do not wrap values in quotes in Railway or `.env`.
 
@@ -66,9 +69,17 @@ Do not wrap values in quotes in Railway or `.env`.
   Returns the tagged record (`due_date`, `naics`, `set_aside`, `place_of_performance`, `section_c/l/m`, `file_id`, and `llm_filled`, the list of fields the model had to fill because regex missed them).
 - `GET /solicitations/{id}`
 - `GET /shortlist/today?firm_id=` — CivicProcureBot proxy
+- `POST /agent/run` `{firm_id, solicitation_id, override_no_bid: false}` — Server-Sent Events: go/no-go, then matrix, narrative, capability statement. A `no_bid` verdict stops after go/no-go (reasons in `decision` and `run_complete`) unless `override_no_bid` is true. Events: `run_started`, `step_started`, `tool_call`, `tool_result`, `decision`, `matrix_row`, `narrative`, `capability_statement`, `step_failed`, `run_complete`; each carries `seq` and `timestamp`. The token guard counts input tokens first and stops with `step_failed` above `MAX_RUN_INPUT_TOKENS`.
+- `GET /runs/{run_id}` — the stored event log of a run, for replay with no model spend. Every `llm_calls` row carries its `run_id`; estimated cost is logged per run.
+- `POST /agent/run-daily` `{firm_id}` with header `X-API-Key` — pulls the CivicProcureBot shortlist, ingests the top 3 by score, runs the full chain on each, and returns a summary list. It never sends email.
+- `GET /demo/solicitations`
 - `GET /health`
 
 Tagging is regex first (Sections C/L/M, due date, NAICS, set-aside, place of performance); a single structured-output Muse Spark call fills only the gaps and never overwrites a regex hit. If that call fails, the regex result is stored as-is.
+
+## Demo data
+
+**Demo firms and demo solicitations are fictional.** Firms 2 and 3 (`demo=true`) and the seeded county facilities electrical maintenance solicitation (NAICS 238210, HUBZone set-aside, Syracuse) are invented for demonstration; none of their clients, contracts, values or references are real. Firm 2 carries three `verified=true` past-performance entries that match the demo solicitation, so a run on it reaches a `bid` or `needs_review` verdict. Firm 1 is the only real firm.
 
 ## Tests
 
@@ -81,5 +92,6 @@ Drop sample solicitations in `tests/fixtures/*.pdf` to enable the real-PDF tagge
 ## Known limits
 
 - SQLite lives on local disk. Fine for the hackathon demo; on Railway the filesystem is ephemeral, so move to Postgres before real data lands there.
+- Token counting uses the Responses API `input_tokens` endpoint (`MetaClient.count_input_tokens`); it is not verified against Meta's live API. If it fails, the run stops at the token guard rather than spending unchecked.
 - Scanned (image-only) PDFs are rejected: no OCR yet.
 - Only Sections C, L, and M are captured.

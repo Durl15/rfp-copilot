@@ -14,6 +14,7 @@ CLAIM_RE = re.compile(
     re.I,
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+SIZE_AMOUNT_RE = re.compile(r"\$\d[\d,]*(?:\.\d+)?M?")
 
 
 def is_verified(entry: dict) -> bool:
@@ -33,6 +34,9 @@ def claim_problems(text: str, firm: dict) -> list[str]:
     any_verified = any(is_verified(e) for e in entries)
     unverified_clients = [str(e["client"]).lower() for e in entries if not is_verified(e) and e.get("client")]
     problems = []
+    # The size standard is a profile fact, not a dollar-value claim: its own amounts must not trip the "$ 34" pattern.
+    for amount in SIZE_AMOUNT_RE.findall(firm.get("size_standard") or ""):
+        text = text.replace(amount, "")
     for sentence in _SENTENCE_SPLIT_RE.split(text.strip()):
         words = [m.group(0) for m in CLAIM_RE.finditer(sentence)]
         if not words:

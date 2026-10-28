@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 
 from app import claims, db, firms, ingest
 from app.agent import tools
+from app.agent.events import noop
 from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
@@ -361,7 +362,7 @@ def _summary(result) -> str:
     return json.dumps(result, default=str)[:SUMMARY_CHARS]
 
 
-def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
+def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient, emit=noop) -> dict:
     """Run the tool loop (one retry on schema/grounding failure), persist rows, return {matrix, trace}."""
     firm = firms.get_firm(firm_id)
     sol = ingest.get_solicitation(solicitation_id)
@@ -390,10 +391,12 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         if res.tool_calls:
             outputs = []
             for call in res.tool_calls:
+                emit("tool_call", tool=call["name"], args=call["arguments"])
                 try:
                     result = tools.execute_tool(call["name"], call["arguments"])
                 except tools.ToolError as exc:
                     result = {"error": str(exc)}
+                emit("tool_result", tool=call["name"], summary=_summary(result))
                 trace.append({"tool": call["name"], "args": call["arguments"], "result_summary": _summary(result)})
                 outputs.append({"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result, default=str)})
             messages = outputs
@@ -413,6 +416,8 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         if not problems:
             matrix = ComplianceMatrix(rows=rows, summary=summarize(rows))
             _save_rows(solicitation_id, firm_id, rows)
+            for r in rows:
+                emit("matrix_row", row=r.model_dump())
             return {"matrix": matrix.model_dump(), "trace": trace}
         problem = "; ".join(problems)
         if retried:

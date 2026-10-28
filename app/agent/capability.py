@@ -7,6 +7,7 @@ from pydantic import BaseModel, ValidationError
 
 from app import claims, firms, ingest
 from app.agent import artifacts
+from app.agent.events import noop
 from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
@@ -63,7 +64,7 @@ def _strings(part: ModelStatement) -> list[str]:
     return [i if i.rstrip().endswith((".", "!", "?")) else i + "." for i in items]
 
 
-def run_capability(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
+def run_capability(firm_id: int, solicitation_id: str, llm: MetaClient, emit=noop) -> dict:
     firm = firms.get_firm(firm_id)
     if not firm or not ingest.get_solicitation(solicitation_id):
         raise LookupError("firm or solicitation not found")
@@ -88,6 +89,7 @@ def run_capability(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             )
             stmt = CapabilityStatement(**part.model_dump(), company_data=company).model_dump()
             artifacts.save_artifact(solicitation_id, firm_id, "capability", stmt)
+            emit("capability_statement", payload=stmt)
             return stmt
         except ValueError as exc:  # pydantic ValidationError is a ValueError
             problem = str(exc)

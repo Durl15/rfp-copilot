@@ -75,6 +75,7 @@ class MetaClient:
             max_retries=0,
         )
         self._sleep = sleep
+        self.run_id: str | None = None  # set by the agent run so llm_calls rows can be summed per run
 
     @property
     def model(self) -> str:
@@ -109,8 +110,8 @@ class MetaClient:
             db.init_db()  # idempotent; lets scripts log without going through FastAPI startup
             with db.session() as conn:
                 conn.execute(
-                    "INSERT INTO llm_calls (ts, model, feature, prompt_tokens, completion_tokens, cached_tokens, latency_ms, ok, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO llm_calls (ts, model, feature, prompt_tokens, completion_tokens, cached_tokens, latency_ms, ok, error, run_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         datetime.now(timezone.utc).isoformat(),
                         self.model,
@@ -121,10 +122,20 @@ class MetaClient:
                         int((time.monotonic() - started) * 1000),
                         0 if error else 1,
                         f"{type(error).__name__}: {error}"[:500] if error else None,
+                        self.run_id,
                     ),
                 )
         except Exception:
             log.exception("failed to write llm_calls row")
+
+    def count_input_tokens(self, messages: list[dict] | str, system: str = "", tools: list[dict] | None = None) -> int:
+        """Meta token counting (Responses API input_tokens endpoint) for a request, without generating anything."""
+        params: dict[str, Any] = {"model": self.model, "input": messages}
+        if system:
+            params["instructions"] = system
+        if tools:
+            params["tools"] = tools
+        return self._with_retry(lambda: self._client.responses.input_tokens.count(**params)).input_tokens
 
     def _with_retry(self, fn):
         for attempt in range(1, MAX_ATTEMPTS + 1):

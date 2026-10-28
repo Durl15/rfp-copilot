@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app import claims, firms, ingest
 from app.agent import tools
+from app.agent.events import noop
 from app.agent.matrix import PP_NONE_MIN as PP_CLEAR_MIN, assess_past_performance
 from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
@@ -111,7 +112,7 @@ def _summary(result) -> str:
     return json.dumps(result, default=str)[:SUMMARY_CHARS]
 
 
-def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
+def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient, emit=noop) -> dict:
     """Run the tool loop, persist the decision, and return {decision, decision_id, trace}."""
     messages = [
         {
@@ -154,13 +155,16 @@ def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             saved = tools.record_decision(
                 solicitation_id, firm_id, out["verdict"], out["score"], reasons, out["verdict_source"], out["rule_reason"],
             )
+            emit("decision", payload=out)
             return {"decision": out, "decision_id": saved["decision_id"], "trace": trace}
         outputs = []
         for call in res.tool_calls:
+            emit("tool_call", tool=call["name"], args=call["arguments"])
             try:
                 result = tools.execute_tool(call["name"], call["arguments"])
             except tools.ToolError as exc:
                 result = {"error": str(exc)}
+            emit("tool_result", tool=call["name"], summary=_summary(result))
             trace.append({"tool": call["name"], "args": call["arguments"], "result_summary": _summary(result)})
             outputs.append({"type": "function_call_output", "call_id": call["call_id"], "output": json.dumps(result, default=str)})
         messages = outputs

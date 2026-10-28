@@ -23,6 +23,10 @@ class Settings:
     civicprocurebot_api_key: str
     sam_api_key: str
     db_path: Path
+    copilot_admin_key: str
+    max_run_input_tokens: int
+    price_in_per_mtok: float
+    price_out_per_mtok: float
 
 
 def get_settings() -> Settings:
@@ -34,4 +38,8 @@ def get_settings() -> Settings:
         civicprocurebot_api_key=_env("CIVICPROCUREBOT_API_KEY"),
         sam_api_key=_env("SAM_API_KEY"),
         db_path=Path(_env("DB_PATH") or ROOT / "data" / "rfp_copilot.sqlite3"),
+        copilot_admin_key=_env("COPILOT_ADMIN_KEY"),
+        max_run_input_tokens=int(_env("MAX_RUN_INPUT_TOKENS") or 60000),
+        price_in_per_mtok=float(_env("PRICE_IN_PER_MTOK") or 0.50),
+        price_out_per_mtok=float(_env("PRICE_OUT_PER_MTOK") or 2.00),
     )

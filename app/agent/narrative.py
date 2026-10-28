@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app import claims, firms, ingest
 from app.agent import artifacts
+from app.agent.events import noop
 from app.agent.matrix import load_matrix
 from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
@@ -26,6 +27,8 @@ SYSTEM_PROMPT = (
     "words in total. Paragraph one: who the firm is, its size standard, HUBZone status, NAICS codes, and that it is based "
     "in the place of performance. Paragraph two: what the firm does, drawn from the past-performance entries only, "
     "described by function and audience. State each fact once; never repeat a sentence or restate a fact. "
+    "Write the size standard exactly as it appears in the firm data, keeping the dollar sign, e.g. "
+    "\"Small business under the $34.0M size standard\". "
     "Never write the phrases \"the firm profile\", \"the profile\" or \"according to\"; write about the firm directly. "
     "Use ONLY facts in the firm data and past performance provided. Never invent numbers, dollar amounts, clients, "
     "certifications or capabilities. Never claim, imply or hint at any capability listed under <gaps>. "
@@ -46,6 +49,9 @@ def _prompt(firm: dict, sol: dict, gaps: list[str]) -> str:
 def check_narrative(text: str, firm: dict) -> list[str]:
     problems = []
     problems.extend(claims.check_text(text, firm))
+    for amount in claims.SIZE_AMOUNT_RE.findall(firm.get("size_standard") or ""):
+        if amount.lstrip("$") in text and amount not in text:
+            problems.append(f"write the size standard amount as {amount}, keeping the dollar sign")
     lowered = text.lower()
     problems.extend(f"never write the phrase {p!r}" for p in BANNED_PHRASES if p in lowered)
     sentences = [" ".join(s.lower().split()) for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
@@ -57,7 +63,7 @@ def check_narrative(text: str, firm: dict) -> list[str]:
     return problems
 
 
-def run_narrative(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
+def run_narrative(firm_id: int, solicitation_id: str, llm: MetaClient, emit=noop) -> dict:
     firm = firms.get_firm(firm_id)
     sol = ingest.get_solicitation(solicitation_id)
     if not firm or not sol:
@@ -75,6 +81,7 @@ def run_narrative(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
         problems = check_narrative(text, firm) if text else ["empty answer"]
         if not problems:
             artifacts.save_artifact(solicitation_id, firm_id, "narrative", text)
+            emit("narrative", text=text)
             return {"narrative": text}
         messages = [{"role": "user", "content": "Rejected: " + "; ".join(problems) + ". Rewrite using only profile facts."}]
     raise RuntimeError(f"narrative did not pass validation ({'; '.join(problems)})")

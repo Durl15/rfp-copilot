@@ -6,9 +6,8 @@ from app.config import get_settings
 router = APIRouter()
 
 
-@router.get("/shortlist/today")
-def shortlist_today(firm_id: str):
-    """Proxy to CivicProcureBot's read-only shortlist endpoint."""
+def fetch_shortlist(firm_id: str):
+    """CivicProcureBot's read-only shortlist for a firm. Raises HTTPException on config or upstream faults."""
     s = get_settings()
     if not (s.civicprocurebot_api_base and s.civicprocurebot_api_key):
         raise HTTPException(503, "CivicProcureBot is not configured")
@@ -26,3 +25,9 @@ def shortlist_today(firm_id: str):
         code = r.status_code if r.status_code in (400, 404, 422) else 502
         raise HTTPException(code, f"CivicProcureBot returned {r.status_code}")
     return r.json()
+
+
+@router.get("/shortlist/today")
+def shortlist_today(firm_id: str):
+    """Proxy to CivicProcureBot's read-only shortlist endpoint."""
+    return fetch_shortlist(firm_id)

@@ -139,6 +139,24 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE decisions ADD COLUMN rule_reason TEXT NOT NULL DEFAULT '';
         """,
     ),
+    (
+        8,
+        """
+        ALTER TABLE llm_calls ADD COLUMN run_id TEXT;
+        CREATE INDEX idx_llm_calls_run ON llm_calls (run_id);
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            firm_id INTEGER NOT NULL,
+            solicitation_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            est_cost_usd REAL NOT NULL DEFAULT 0,
+            events TEXT NOT NULL DEFAULT '[]'
+        );
+        ALTER TABLE firms ADD COLUMN demo INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE solicitations ADD COLUMN demo INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
 ]
 
 

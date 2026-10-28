@@ -12,6 +12,7 @@ _JSON_COLS = ("certifications", "naics_codes", "past_performance")
 def _decode(row) -> dict:
     out = dict(row)
     out["hubzone"] = bool(out["hubzone"])
+    out["demo"] = bool(out["demo"])
     for c in _JSON_COLS:
         out[c] = json.loads(out[c])
     for entry in out["past_performance"]:

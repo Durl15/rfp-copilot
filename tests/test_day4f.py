@@ -24,6 +24,8 @@ UNVERIFIED = [{**e, "verified": False} for e in HELP_DESK_ENTRIES]
 # 1. verified flag and conservative seed
 def test_every_seed_entry_is_unverified_and_free_of_claims():
     for f in seed.FIRMS:
+        if f["id"] == 2:  # demo firm 2 carries verified entries on purpose
+            continue
         for e in f["past_performance"]:
             assert e["verified"] is False
             assert set(e) == {"client", "scope", "verified"}
@@ -110,7 +112,7 @@ def test_private_profile_replaces_firm_1_and_keeps_verified_flags(tmp_path, monk
     monkeypatch.setattr(seed, "PRIVATE_PROFILE", path)
     seed_firms()
     assert firms.get_firm(1)["past_performance"] == entries
-    assert len(firms.get_firm(2)["past_performance"]) == 2
+    assert len(firms.get_firm(2)["past_performance"]) == 3
 
 
 def test_no_private_profile_leaves_the_seed(tmp_path, monkeypatch):

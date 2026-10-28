@@ -94,7 +94,7 @@ def test_post_text(client, llm):
     body = r.json()
     assert body["source"] == "text" and body["naics"] == "541512" and "raw_text" not in body
     assert client.get(f"/solicitations/{body['id']}").json()["due_date"] == "2026-10-30"
-    assert len(rows("SELECT * FROM solicitations")) == 1
+    assert len(rows("SELECT * FROM solicitations WHERE demo = 0")) == 1
 
 
 def test_post_pdf_uploads_and_extracts(client, llm, monkeypatch):
