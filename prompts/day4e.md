@@ -1,0 +1,8 @@
+﻿Fix: the agent loops fail with a 400 error saying the referenced response was not found or expired.
+1. In MetaClient.complete: pass store=True on every responses.create call.
+2. Never pass previous_response_id from a response whose status is not completed. In the incomplete-retry path, resend the original request (same input, same previous_response_id as the original attempt, or none) with the larger token cap and lower effort, never the incomplete response id.
+3. Make the tool loops stateless-safe. Keep a local list of conversation items per run: the original input, every output item from each response including reasoning items and function_call items, and each function_call_output. Call responses.create with previous_response_id when available. If it raises a BadRequestError whose message contains the text referenced response not found or the word expired, retry once with previous_response_id removed and input set to the full local item list. Log a warning when this fallback fires.
+4. Put this in one shared helper and route go_no_go.py, matrix.py, narrative.py and capability.py through it, so no loop calls responses.create with previous_response_id directly.
+5. The network and 5xx retry in _with_retry must resend the identical request. If the max_output_tokens retry in complete raises that same missing-or-expired error, use the stateless fallback from item 3 instead of failing.
+6. Tests with the mocked client: the fallback fires on that error and the full item list is sent; the incomplete retry does not reuse the incomplete id; store=True is sent. All green.
+Commit message: Fix: stateless-safe agent loops, store=True, no reuse of incomplete response ids. Do not push.
