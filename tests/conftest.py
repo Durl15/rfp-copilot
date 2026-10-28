@@ -1,12 +1,13 @@
 import pytest
 
-from app import db
+from app import db, seed
 
 
 @pytest.fixture(autouse=True)
 def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.sqlite3"))
     monkeypatch.setenv("META_MODEL", "muse-spark-1.3")
+    monkeypatch.setattr(seed, "PRIVATE_PROFILE", tmp_path / "no_private_profile.json")
     db.init_db()
     return tmp_path / "test.sqlite3"
 
