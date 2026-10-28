@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ValidationError
 
-from app import db, firms, ingest
+from app import claims, db, firms, ingest
 from app.agent import tools
 from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
@@ -82,7 +82,9 @@ RUBRIC = (
     "or be exactly \"" + NO_EVIDENCE + "\".\n"
     "2. gap \"none\" requires at least one such verbatim quote. If you cannot quote a documented fact, the gap is "
     "\"partial\" or \"full\" and evidence_needed says what to provide.\n"
-    "3. Never invent credentials, clearances, certifications, contract numbers, customers, dollar values or past performance. "
+    "3. Past-performance entries with verified false show relevance only. Their wording supports gap partial at best, never "
+    "none; evidence_needed names the proof to supply (client, dates, value, reference).\n"
+    "4. Never invent credentials, clearances, certifications, contract numbers, customers, dollar values or past performance. "
     "Use the tools to search past performance or read the solicitation if needed. "
     "When finished, reply with the final JSON matrix only."
 )
@@ -214,7 +216,7 @@ def _size_comparable(size: str, verified: list[dict]) -> bool:
     wanted = max(_numbers(size), default=None)
     if wanted is None:
         return False
-    return any(n >= PP_SIZE_RATIO * wanted for m in verified for n in _numbers(" ".join(map(str, m["entry"].values()))))
+    return any(n >= PP_SIZE_RATIO * wanted for m in verified if claims.is_verified(m["entry"]) for n in _numbers(" ".join(map(str, m["entry"].values()))))
 
 
 def assess_past_performance(firm: dict, sol: dict, llm: MetaClient) -> dict:
@@ -222,7 +224,7 @@ def assess_past_performance(firm: dict, sol: dict, llm: MetaClient) -> dict:
     terms, size = extract_scope(sol, llm)
     wanted = {t.lower() for t in terms}
     verified = []
-    for entry in firm["past_performance"]:
+    for entry in claims.redact(firm)["past_performance"]:
         user = f"scope terms: {json.dumps(terms)}\n\nentry:\n{json.dumps(entry, default=str)}"
         try:
             m = _ask(llm, MATCH_PROMPT, user, MATCH_SCHEMA, EntryMatch, "pp_match", PP_MATCH_TOKENS)
@@ -246,8 +248,8 @@ def apply_past_performance(rows: list[MatrixRow], pp: dict | None) -> list[Matri
         return rows
     verified, size = pp["verified"], pp["size"]
     quoted = [f'"{m["quote"]}" for "{m["client"]}".' if m["client"] else f'"{m["quote"]}".' for m in verified]
-    n = len(verified)
-    gap = "none" if n >= PP_NONE_MIN else "partial" if n else "full"
+    n = sum(claims.is_verified(m["entry"]) for m in verified)  # unverified matches show relevance only
+    gap = "none" if n >= PP_NONE_MIN else "partial" if verified else "full"
     undersized = gap == "none" and bool(size) and not _size_comparable(size, verified)
     if undersized:
         gap = "partial"
@@ -258,6 +260,11 @@ def apply_past_performance(rows: list[MatrixRow], pp: dict | None) -> list[Matri
         evidence = f"Provide a past-performance reference of comparable size ({size})"
         draft = ("Documented similar-scope past performance: " + " ".join(quoted)
                  + f" Still to supply: a reference of comparable size ({size}).")
+    elif n < len(verified):
+        evidence = ("Provide proof for the matching unverified entries (client, dates, value, reference) and "
+                    f"{PP_NONE_MIN} past-performance references of similar size and scope")
+        draft = ("Similar-scope work is described in the profile but not yet verified: " + " ".join(quoted)
+                 + f" Still to supply: proof (client, dates, value, reference) and {PP_NONE_MIN} references of similar size and scope.")
     elif gap == "partial":
         evidence = f"Provide {PP_NONE_MIN - n} more past-performance reference(s) of similar size and scope"
         draft = ("Documented similar-scope past performance: " + " ".join(quoted)
@@ -297,7 +304,8 @@ def _unquoted_sentences(text: str) -> list[str]:
 
 def check_grounding(rows: list[MatrixRow], firm: dict) -> list[str]:
     """Problems that make the model retry: ungrounded or unquoted capability claims, and draft_response rule breaks."""
-    facts = _leaves(firm)
+    facts = _leaves(claims.redact(firm))
+    proven = _leaves({**firm, "past_performance": [e for e in firm["past_performance"] if claims.is_verified(e)]})
     problems = []
     for i, row in enumerate(rows, 1):
         label = f"row {i} ({row.requirement[:60]!r})"
@@ -312,6 +320,8 @@ def check_grounding(rows: list[MatrixRow], firm: dict) -> list[str]:
             problems.append(f"{label} has firm_capability sentences with no verbatim quote (use exactly {NO_EVIDENCE!r}): {loose}")
         elif row.gap == "none" and not (submission or evaluation) and not quotes:
             problems.append(f"{label} has gap 'none' but quotes no documented fact")
+        elif row.gap == "none" and not (submission or evaluation) and not any(_norm(q) in f for q in quotes for f in proven):
+            problems.append(f"{label} has gap 'none' but quotes only unverified past performance; use gap 'partial'")
         if OFFICE_RE.search(row.draft_response) and not any("office" in f for f in facts):
             problems.append(f"{label} uses the word 'office'; write 'Based in' plus the profile's place_of_performance instead")
         if submission:
@@ -357,7 +367,7 @@ def run_matrix(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
     sol = ingest.get_solicitation(solicitation_id)
     if not firm or not sol:
         raise LookupError("firm or solicitation not found")
-    system = _system_prompt(firm)
+    system = _system_prompt(claims.redact(firm))
     messages = [{"role": "user", "content": _user_message(sol)}]
     trace: list[dict] = []
     conv = Conversation(

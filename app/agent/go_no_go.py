@@ -28,6 +28,8 @@ SYSTEM_PROMPT = (
     "blockers lists ONLY hard disqualifiers: a required certification the firm lacks, a set-aside the firm does not "
     "qualify for, a NAICS code outside the firm's codes, or a due date that has already passed. Weak fit, thin past "
     "performance, or effort concerns are NOT blockers; put them in top_reasons. "
+    "Past-performance entries with verified false show relevance only: never count them as proof of capability, and say "
+    "in top_reasons what proof the firm must supply. "
     "top_reasons has at most 3 entries and the FIRST must be the single decisive factor behind the verdict. "
     "Score 0-100 for fit (70+ bid, 40-69 needs_review, below 40 no_bid unless a blocker says otherwise). "
     "rationale_for_verdict is ONE sentence explaining why the verdict is bid, needs_review, or no_bid rather than the other two. "

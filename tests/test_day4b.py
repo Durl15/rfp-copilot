@@ -25,7 +25,7 @@ PP_ROW = {
 
 HELP_DESK_SOL = {"section_c": "The contractor shall provide help desk support and ITSM migration.", "title": "t"}
 HELP_DESK_ENTRIES = [
-    {"client": f"County {i}", "scope": f"Help desk operation and ITSM migration for county agency {i}", "dates": "2024"}
+    {"client": f"County {i}", "scope": f"Help desk operation and ITSM migration for county agency {i}", "dates": "2024", "verified": True}
     for i in range(3)
 ]
 
@@ -155,7 +155,7 @@ def test_narrative_saves_and_prompt_lists_full_gaps():
 def test_narrative_number_guard_rejects_invented_numbers_then_retries():
     sol_id = _setup_matrix()
     bad = _text(100, " We delivered 47 projects worth $2M.")
-    llm, sdk = _llm(_response("n1", _message(bad)), _response("n2", _message(_text(100, " Since 2023."))))
+    llm, sdk = _llm(_response("n1", _message(bad)), _response("n2", _message(_text(100))))
     out = narrative.run_narrative(1, sol_id, llm)
     assert len(sdk.calls) == 2 and "numbers not in the firm profile" in sdk.calls[1]["input"][0]["content"]
     assert "47" not in out["narrative"]
@@ -174,7 +174,7 @@ def test_narrative_requires_matrix_and_fails_after_second_bad_answer():
 def test_number_guard_accepts_profile_numbers():
     seed_firms()
     firm = firms.get_firm(1)
-    assert artifacts.ungrounded_numbers("NAICS 541512, $10K-$75K, since 2023.", firm) == []
+    assert artifacts.ungrounded_numbers("NAICS 541512 under the $34.0M size standard.", firm) == []
     assert artifacts.ungrounded_numbers("Won $5,000,000.", firm) == ["$5,000,000"]
 
 
@@ -182,7 +182,7 @@ STATEMENT = {
     "headline": "AI advisory for CNY organizations",
     "core_competencies": ["Workflow automation"],
     "differentiators": ["HUBZone-certified"],
-    "past_performance_summaries": ["IT consulting since 2023."],
+    "past_performance_summaries": ["IT consulting for small organizations."],
 }
 
 

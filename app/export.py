@@ -78,7 +78,15 @@ def _table(doc: Document, headers: list[str], rows: list[list[str | list[str]]],
     if widths:
         sec = doc.sections[0]
         total = sec.page_width - sec.left_margin - sec.right_margin
-        t.autofit = False
+        t.autofit = False  # fixed layout: Word and LibreOffice then honor the grid and cell widths
+        tbl_w = t._tbl.tblPr.find(qn("w:tblW"))
+        if tbl_w is None:
+            tbl_w = OxmlElement("w:tblW")
+            t._tbl.tblPr.append(tbl_w)
+        tbl_w.set(qn("w:type"), "dxa")
+        tbl_w.set(qn("w:w"), str(int(total * sum(widths) / 635)))  # EMU to twips
+        for col, w in zip(t.columns, widths):
+            col.width = int(total * w)
         for r in t.rows:
             for cell, w in zip(r.cells, widths):
                 cell.width = int(total * w)

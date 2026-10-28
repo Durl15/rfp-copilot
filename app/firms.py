@@ -14,6 +14,8 @@ def _decode(row) -> dict:
     out["hubzone"] = bool(out["hubzone"])
     for c in _JSON_COLS:
         out[c] = json.loads(out[c])
+    for entry in out["past_performance"]:
+        entry["verified"] = entry.get("verified") is True
     return out
 
 

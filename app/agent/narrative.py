@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app import firms, ingest
+from app import claims, firms, ingest
 from app.agent import artifacts
 from app.agent.matrix import load_matrix
 from app.llm.conversation import Conversation
@@ -22,6 +22,8 @@ SYSTEM_PROMPT = (
     "You write the firm narrative for a federal proposal. Write about 200 words of plain prose in one or two paragraphs. "
     "Use ONLY facts in the firm profile and past performance provided. Never invent numbers, dollar amounts, clients, "
     "certifications or capabilities. Never claim, imply or hint at any capability listed under <gaps>. "
+    "Past-performance entries with verified false: state only what the work does and who it is for. Never mention "
+    "dates, dollar values, client retention, references, production status or demos for them. "
     "Reply with the narrative text only."
 )
 
@@ -36,8 +38,7 @@ def _prompt(firm: dict, sol: dict, gaps: list[str]) -> str:
 
 def check_narrative(text: str, firm: dict) -> list[str]:
     problems = []
-    if bad := artifacts.ungrounded_numbers(text, firm):
-        problems.append(f"numbers not in the firm profile: {bad}")
+    problems.extend(claims.check_text(text, firm))
     words = len(text.split())
     if not MIN_WORDS <= words <= MAX_WORDS:
         problems.append(f"narrative is {words} words; write about 200")
@@ -53,7 +54,7 @@ def run_narrative(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
     if not matrix:
         raise LookupError("no matrix for this firm and solicitation; run /agent/matrix first")
     gaps = [r["requirement"] for r in matrix["rows"] if r["gap"] == "full" and r["requirement_type"] != "submission"]
-    messages = [{"role": "user", "content": _prompt(firm, sol, gaps)}]
+    messages = [{"role": "user", "content": _prompt(claims.redact(firm), sol, gaps)}]
     conv = Conversation(llm, system=SYSTEM_PROMPT, reasoning_effort="minimal", feature="narrative", max_tokens=MAX_TOKENS)
     problems = []
     for _ in range(2):

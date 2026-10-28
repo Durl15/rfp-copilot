@@ -5,7 +5,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app import db, firms, ingest
+from app import claims, db, firms, ingest
 
 SECTION_CHARS = 3000
 EXCERPT_CHARS = 3000
@@ -72,7 +72,8 @@ class ToolError(ValueError):
 
 
 def get_firm_profile(firm_id: int) -> dict:
-    return firms.get_firm(firm_id) or {"error": f"firm {firm_id} not found"}
+    firm = firms.get_firm(firm_id)
+    return claims.redact(firm) if firm else {"error": f"firm {firm_id} not found"}
 
 
 def get_solicitation(solicitation_id: str) -> dict:
@@ -97,6 +98,7 @@ def search_past_performance(firm_id: int, keywords: list[str]) -> dict:
     firm = firms.get_firm(firm_id)
     if not firm:
         return {"error": f"firm {firm_id} not found"}
+    firm = claims.redact(firm)
     kws = [k for k in (k.lower().strip() for k in keywords) if k and k not in STOPWORDS]
     matches = []
     for entry in firm["past_performance"]:

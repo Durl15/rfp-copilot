@@ -1,0 +1,12 @@
+[
+  {
+    "client": "Example County IT Department",
+    "scope": "Help desk operation and ITSM migration for county agencies",
+    "value_range": "$100K-$250K",
+    "dates": "2023-2024",
+    "role": "Prime",
+    "outcome": "Delivered on scope and on schedule",
+    "reference": "Jane Doe, IT Director, jane.doe@example.gov",
+    "verified": false
+  }
+]

@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ValidationError
 
-from app import firms, ingest
+from app import claims, firms, ingest
 from app.agent import artifacts
 from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
@@ -20,7 +20,8 @@ SYSTEM_PROMPT = (
     "You write a federal capability statement. Use ONLY facts in the firm profile and past performance provided. "
     "Never invent numbers, dollar amounts, clients, certifications or capabilities. "
     "headline: one line. core_competencies: 3-6 short items. differentiators: 2-4 short items. "
-    "past_performance_summaries: one sentence per past-performance entry. Reply with the JSON only."
+    "past_performance_summaries: one sentence per past-performance entry; for entries with verified false state only what "
+    "the work does and who it is for, with no dates, dollar values, client retention, references, production status or demos. Reply with the JSON only."
 )
 
 
@@ -56,11 +57,17 @@ STATEMENT_SCHEMA = {
 }
 
 
+def _strings(part: ModelStatement) -> list[str]:
+    """Every model-written string, each ended with a period so claims are checked per item."""
+    items = [part.headline, *part.core_competencies, *part.differentiators, *part.past_performance_summaries]
+    return [i if i.rstrip().endswith((".", "!", "?")) else i + "." for i in items]
+
+
 def run_capability(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
     firm = firms.get_firm(firm_id)
     if not firm or not ingest.get_solicitation(solicitation_id):
         raise LookupError("firm or solicitation not found")
-    profile = json.dumps(firm, sort_keys=True, default=str)
+    profile = json.dumps(claims.redact(firm), sort_keys=True, default=str)
     messages = [{"role": "user", "content": f"<firm_profile>\n{profile}\n</firm_profile>\nWrite the capability statement."}]
     conv = Conversation(
         llm, system=SYSTEM_PROMPT, json_schema=STATEMENT_SCHEMA, schema_name="capability_statement",
@@ -73,8 +80,8 @@ def run_capability(firm_id: int, solicitation_id: str, llm: MetaClient) -> dict:
             if res.parsed is None:
                 raise ValueError(res.parse_error or "no JSON answer returned")
             part = ModelStatement.model_validate(res.parsed)
-            if bad := artifacts.ungrounded_numbers(part.model_dump_json(), firm):
-                raise ValueError(f"numbers not in the firm profile: {bad}")
+            if bad := claims.check_text(" ".join(_strings(part)), firm):
+                raise ValueError("; ".join(bad))
             company = CompanyData(
                 name=firm["name"], naics_codes=firm["naics_codes"], certifications=firm["certifications"],
                 location=firm["place_of_performance"],
