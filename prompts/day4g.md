@@ -1,0 +1,6 @@
+﻿Day 4g: narrative quality and deterministic verdict floor.
+1. Narrative prompt: exactly two short paragraphs, 120 to 170 words. Never write the phrases the firm profile, the profile, or according to. State each fact once. Paragraph one: who the firm is, size standard, HUBZone, NAICS codes, based in the place of performance. Paragraph two: what the firm does, from entries only, by function and audience. Validator rejects those phrases, repeated sentences, and word counts outside 100 to 190, with one retry.
+2. Go/no-go verdict floor in code, after the model answers: run the same verified past-performance matching as the matrix (reuse that function). Zero verified matches forces verdict no_bid and caps score at 35. One or two matches forces needs_review and caps score at 65. Three or more leaves the model verdict. Hard blockers still force no_bid. Add a verdict_source field (model or rule) and a rule_reason string to the response and the decisions table.
+3. The go/no-go prompt tells the model the rule so its reasons agree with it.
+4. Tests: zero matches gives no_bid with the cap even if the mocked model says bid; two matches caps at needs_review; three leaves the model verdict; narrative validator rejects the banned phrases.
+Commit: Day 4g: narrative rewrite rules, deterministic verdict floor. Do not push.
