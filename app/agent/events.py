@@ -9,11 +9,12 @@ def noop(event: str, **data) -> None:
 
 
 class Emitter:
-    def __init__(self, sink: Callable[[dict], None] | None = None):
-        self.run_id = uuid.uuid4().hex
-        self.events: list[dict] = []
+    def __init__(self, sink: Callable[[dict], None] | None = None, run_id: str | None = None, events: list[dict] | None = None):
+        """run_id and events resume an earlier log (seq continues after the last stored event)."""
+        self.run_id = run_id or uuid.uuid4().hex
+        self.events: list[dict] = list(events or [])
         self._sink = sink
-        self._seq = 0
+        self._seq = self.events[-1]["seq"] if self.events else 0
 
     def __call__(self, event: str, **data) -> None:
         self._seq += 1

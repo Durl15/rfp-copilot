@@ -157,6 +157,22 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE solicitations ADD COLUMN demo INTEGER NOT NULL DEFAULT 0;
         """,
     ),
+    (
+        9,
+        """
+        ALTER TABLE llm_calls ADD COLUMN audio_seconds REAL;
+        CREATE TABLE pending_entries (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            firm_id INTEGER NOT NULL,
+            run_id TEXT NOT NULL,
+            transcript TEXT NOT NULL,
+            entry TEXT NOT NULL,
+            evidence TEXT NOT NULL,
+            verified INTEGER NOT NULL DEFAULT 0
+        );
+        """,
+    ),
 ]
 
 
