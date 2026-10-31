@@ -77,6 +77,20 @@ Do not wrap values in quotes in Railway or `.env`.
 
 Tagging is regex first (Sections C/L/M, due date, NAICS, set-aside, place of performance); a single structured-output Muse Spark call fills only the gaps and never overwrites a regex hit. If that call fails, the regex result is stored as-is.
 
+## Voice intake
+
+`POST /voice/past-performance` (multipart: `audio`, `firm_id`, optional `hints`) accepts any audio upload (m4a, mp3, wav, ogg, webm, aac). It is converted with ffmpeg to 16 kHz mono 16-bit PCM WAV, transcribed, then extracted into a pending entry that only reaches the firm's past performance after `POST /voice/confirm`. `hints` is a comma-separated list of proper nouns (e.g. `The Woodfork Group, East Adams`); a transcribed name that is a close phonetic match is written with the hint spelling in the field value while the evidence quote stays verbatim. Unreadable audio returns 400 `unsupported or corrupt audio`; ASR failures return 502 after one retry on 5xx/timeout.
+
+Muse Voice Transcribe contract (`POST {META_API_BASE}/asr/transcribe`, bearer `MODEL_API_KEY`):
+
+- Multipart with exactly two parts: `request` (`application/json`: `{"model": "muse-voice-transcribe-1.0", "audioEncoding": "WAV"}`) and `audio` (`audio/wav`). Other part names return 400.
+- WAV only, mono 16-bit PCM at 16 or 24 kHz. m4a, mp3 and other encodings are rejected.
+- 200 response: `{"sessionId", "transcript", "audioDurationMs", "turns": []}`.
+
+Conversion uses ffmpeg from the `imageio-ffmpeg` package (no system ffmpeg). The `imageio-ffmpeg` 0.7.0 `manylinux2014_x86_64` wheel bundles a linux x86_64 ffmpeg binary, so the Railway image needs no change.
+
+Smoke test (one real call): `python scripts/voice_smoke.py <audio> [firm_id] [--hints "a, b"]`.
+
 ## Demo data
 
 **Demo firms and demo solicitations are fictional.** Firms 2 and 3 (`demo=true`) and the seeded county facilities electrical maintenance solicitation (NAICS 238210, HUBZone set-aside, Syracuse) are invented for demonstration; none of their clients, contracts, values or references are real. Firm 2 carries three `verified=true` past-performance entries that match the demo solicitation, so a run on it reaches a `bid` or `needs_review` verdict. Firm 1 is the only real firm.

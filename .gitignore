@@ -13,3 +13,6 @@ dist/
 .venv/
 logs/
 logs/
+data/*.m4a
+data/*.wav
+data/*.mp3

@@ -1,6 +1,10 @@
+import io
 import json
+import wave
+from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -45,7 +49,7 @@ class FakeLLM:
 
 @pytest.fixture(autouse=True)
 def fake_asr(monkeypatch):
-    monkeypatch.setattr(voice, "transcribe", lambda *a, **k: {"text": TRANSCRIPT, "audio_seconds": 12.5})
+    monkeypatch.setattr(voice, "transcribe", lambda *a, **k: {"text": TRANSCRIPT, "audio_duration_ms": 12500, "raw": {"transcript": TRANSCRIPT, "audioDurationMs": 12500}, "wav_bytes": 1})
     seed_firms()
 
 
@@ -133,15 +137,110 @@ def test_check_evidence_is_case_and_whitespace_insensitive():
     assert voice.check_evidence("Hello  World", {"client": "x"}, {"client": "hello\nworld"}) == []
 
 
-def test_transcribe_posts_to_asr_and_logs_call(monkeypatch):
-    seen = {}
+def tiny_wav(seconds=0.2, rate=44100) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x01" * 2 * int(rate * seconds))
+    return buf.getvalue()
+
+
+def capture_post(monkeypatch, *responses):
+    calls, queue = [], list(responses)
 
     def fake_post(url, **kw):
-        seen.update(url=url, **kw)
-        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"text": " hello ", "duration": 3.5})
+        calls.append({"url": url, **kw})
+        r = queue.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
 
     monkeypatch.setattr(voice.httpx, "post", fake_post)
-    out = REAL_TRANSCRIBE(b"abc", "n.m4a", "audio/mp4", "run1")
-    assert out == {"text": "hello", "audio_seconds": 3.5}
-    assert seen["url"].endswith("/asr/transcribe") and seen["data"] == {"model": "muse-voice-transcribe-1.0"}
-    assert rows("SELECT feature, audio_seconds, ok FROM llm_calls WHERE run_id = 'run1'") == [{"feature": "voice_transcribe", "audio_seconds": 3.5, "ok": 1}]
+    return calls
+
+
+def resp(status=200, body=None, text=""):
+    return SimpleNamespace(status_code=status, json=lambda: body, text=text or json.dumps(body))
+
+
+OK = {"sessionId": "s1", "transcript": " hello ", "audioDurationMs": 60000, "turns": []}
+
+
+def test_transcribe_sends_exact_parts_converts_and_logs(monkeypatch):
+    calls = capture_post(monkeypatch, resp(200, OK))
+    out = REAL_TRANSCRIBE(tiny_wav(), "n.m4a", "audio/mp4", "run1")  # real ffmpeg, 44.1 kHz stereo in
+    c = calls[0]
+    assert c["url"].endswith("/asr/transcribe") and set(c["files"]) == {"request", "audio"} and "data" not in c
+    name, value, ctype = c["files"]["request"]
+    assert name is None and ctype == "application/json" and json.loads(value) == {"model": "muse-voice-transcribe-1.0", "audioEncoding": "WAV"}
+    _, wav_bytes, wtype = c["files"]["audio"]
+    assert wtype == "audio/wav" and c["timeout"] == 180
+    with wave.open(io.BytesIO(wav_bytes)) as w:
+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 16000)
+    assert out["text"] == "hello" and out["audio_duration_ms"] == 60000 and out["raw"] == OK
+    assert rows("SELECT feature, model, audio_duration_ms, ok FROM llm_calls WHERE run_id = 'run1'") == [
+        {"feature": "voice_transcribe", "model": "muse-voice-transcribe-1.0", "audio_duration_ms": 60000, "ok": 1}]
+
+
+def test_ffmpeg_failure_is_400(monkeypatch):
+    calls = capture_post(monkeypatch)
+    monkeypatch.setattr(voice, "transcribe", REAL_TRANSCRIBE)
+    app.dependency_overrides[get_llm] = lambda: FakeLLM()
+    try:
+        r = TestClient(app).post("/voice/past-performance", files={"audio": ("bad.m4a", b"not audio", "audio/mp4")}, data={"firm_id": 1})
+    finally:
+        app.dependency_overrides.clear()
+    assert r.status_code == 400 and r.json()["detail"].startswith("unsupported or corrupt audio") and calls == []
+
+
+def test_asr_retries_once_on_5xx_then_502(monkeypatch):
+    calls = capture_post(monkeypatch, resp(503, text="down"), httpx.ReadTimeout("slow"))
+    with pytest.raises(voice.VoiceError) as e:
+        REAL_TRANSCRIBE(tiny_wav(), "n.wav", "audio/wav", "run2")
+    assert e.value.status == 502 and len(calls) == 2
+    assert rows("SELECT ok FROM llm_calls WHERE run_id = 'run2'") == [{"ok": 0}]
+
+
+def test_asr_retry_recovers_and_4xx_not_retried(monkeypatch):
+    calls = capture_post(monkeypatch, resp(500, text="x"), resp(200, OK))
+    assert REAL_TRANSCRIBE(tiny_wav(), "n.wav", "audio/wav", "run3")["text"] == "hello" and len(calls) == 2
+    calls = capture_post(monkeypatch, resp(400, text="Malformed request"))
+    with pytest.raises(voice.VoiceError, match="Malformed request"):
+        REAL_TRANSCRIBE(tiny_wav(), "n.wav", "audio/wav", "run4")
+    assert len(calls) == 1
+
+
+def test_route_stores_duration_and_raw_response(monkeypatch):
+    monkeypatch.setattr(voice, "transcribe", lambda *a, **k: {"text": TRANSCRIPT, "audio_duration_ms": 60000, "raw": OK, "wav_bytes": 1})
+    assert upload(FakeLLM(good())).status_code == 200
+    assert json.loads(rows("SELECT raw_response FROM pending_entries")[0]["raw_response"]) == OK
+
+
+WOODFORK = (Path(__file__).parent / "fixtures" / "voice_transcript_woodfork.txt").read_text(encoding="utf-8")
+W_ENTRY = {"client": "The Woodfork Group", "scope": "East Adams RFQ project and the City MWBE project", "value_range": None,
+           "dates": "four months; late February 2027", "role": "AI platform development and staff training",
+           "outcome": "faster bid turnaround", "reference": "Terry Woodfork"}
+W_QUOTES = {"client": "The client was the Woodford Group", "scope": "East Adam RFQ project and the City MWBE project", "value_range": None,
+            "dates": "Over four months", "role": "AI platform development and and staff training", "outcome": "faster faster bid turnaround",
+            "reference": "Terry Woodford president of the Woodford Group"}
+
+
+def test_hints_reach_prompt_and_value_differs_from_verbatim_quote():
+    llm = FakeLLM(good(W_ENTRY, W_QUOTES))
+    entry, evidence = voice.extract_entry(WOODFORK, llm, "The Woodfork Group, East Adams, Terry Woodfork")
+    assert entry["client"] == "The Woodfork Group" and "Woodford" in evidence["client"]
+    assert voice.check_evidence(WOODFORK, entry, evidence) == []
+    assert "hint" in llm.calls[0]["system"] and "phonetic" in llm.calls[0]["system"]
+    llm2 = FakeLLM(good(W_ENTRY, W_QUOTES))
+    voice.extract_entry(WOODFORK, llm2)
+    assert "phonetic" not in llm2.calls[0]["system"]
+
+
+def test_preamble_firm_is_not_the_client():
+    assert "speaker, never the client" in voice.EXTRACT_PROMPT
+    bad = {**W_ENTRY, "client": "DJ AI business consultant"}
+    assert voice.check_evidence(WOODFORK, bad, {**W_QUOTES, "client": "note for DJ AI business consultant"}) == []
+    entry, _ = voice.extract_entry(WOODFORK, FakeLLM(good(W_ENTRY, W_QUOTES)))
+    assert "DJ AI" not in entry["client"] and entry["value_range"] is None

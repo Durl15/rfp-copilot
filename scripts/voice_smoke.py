@@ -1,24 +1,42 @@
-"""One real transcription call. Run manually: python scripts/voice_smoke.py <audio.wav|mp3|m4a> (never from tests)."""
+"""One real transcription + extraction call. Run manually (never from tests):
+python scripts/voice_smoke.py <audio> [firm_id] [--hints "a, b"]"""
+import argparse
+import json
 import sys
-import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import db  # noqa: E402
-from app.voice import transcribe  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
-TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4"}
+from app import db, voice  # noqa: E402
+from app.main import app  # noqa: E402
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or Path(sys.argv[1]).suffix.lower() not in TYPES:
-        sys.exit("usage: python scripts/voice_smoke.py <audio file: .wav, .mp3 or .m4a>")
-    path = Path(sys.argv[1])
+    ap = argparse.ArgumentParser()
+    ap.add_argument("audio", type=Path)
+    ap.add_argument("firm_id", type=int, nargs="?", default=1)
+    ap.add_argument("--hints")
+    a = ap.parse_args()
     db.init_db()
-    t = transcribe(path.read_bytes(), path.name, TYPES[path.suffix.lower()], uuid.uuid4().hex)
-    print(f"audio_seconds: {t['audio_seconds']}")
-    print(t["text"])
+    data = a.audio.read_bytes()
+    try:
+        print(f"converted WAV bytes: {len(voice.to_wav(data, a.audio.name))}")
+    except voice.VoiceError as exc:
+        sys.exit(f"{exc.status}: {exc.detail}")
+    form = {"firm_id": a.firm_id, **({"hints": a.hints} if a.hints else {})}
+    r = TestClient(app).post("/voice/past-performance", files={"audio": (a.audio.name, data)}, data=form)
+    if r.status_code != 200:
+        sys.exit(f"{r.status_code}: {r.text}")
+    body = r.json()
+    with db.session() as conn:
+        raw = json.loads(conn.execute("SELECT raw_response FROM pending_entries WHERE id = ?", (body["pending_id"],)).fetchone()["raw_response"])
+    print(f"transcript: {body['transcript']}")
+    print(f"audioDurationMs: {raw.get('audioDurationMs')}")
+    for f in voice.FIELDS:
+        print(f"{f}: {body['entry'][f]!r}  <- {body['evidence'][f]!r}")
+    print(f"pending_id: {body['pending_id']}")
 
 
 if __name__ == "__main__":

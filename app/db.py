@@ -173,6 +173,13 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        10,
+        """
+        ALTER TABLE llm_calls ADD COLUMN audio_duration_ms INTEGER;
+        ALTER TABLE pending_entries ADD COLUMN raw_response TEXT;
+        """,
+    ),
 ]
 
 
