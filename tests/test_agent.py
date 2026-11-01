@@ -67,6 +67,7 @@ FINAL = {
     "estimated_effort_hours": 56,
     "set_aside_match": True,
     "naics_match": True,
+    "verified_matches": [{"entry_index": i, "why": "scope matches"} for i in range(3)],
 }
 
 

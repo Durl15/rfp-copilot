@@ -165,3 +165,75 @@ def test_tagger_on_fixture_pdf(pdf):
     tags = ingest.regex_tag(text)
     assert set(tags) == set(ingest.FIELDS)
     assert any(tags.values()), f"regex pass found nothing in {pdf.name}"
+
+
+DASNY_LIKE = """Request for Proposals 7628 - Small Business Capacity Building Services
+Issue Date: December 15, 2025
+Pre-Proposal Conference: January 8, 2026
+Questions Deadline: January 20, 2026
+Proposals Due: February 2, 2026 at 3:00 PM
+Contract participation goals: MBE 18%, WBE 12%, SDVOB 6%. Offerors shall make good faith efforts to meet the goals.
+"""
+
+
+def test_utilization_goals_are_not_a_set_aside():
+    tags = ingest.regex_tag(DASNY_LIKE.replace("", ""))
+    assert tags["set_aside"] is None
+    assert tags["participation_goals"] == "MBE 18%, WBE 12%, SDVOB 6%"
+
+
+def test_real_set_aside_still_tagged_and_goal_text_does_not_hide_it():
+    assert ingest.regex_tag("This is a total small business set-aside. MWBE goal 30%.")["set_aside"] == "Small Business"
+    assert ingest.regex_tag(SAMPLE_TEXT)["participation_goals"] is None
+    assert ingest.regex_tag("Participation goal: 6% SDVOB.")["set_aside"] is None
+    assert ingest.regex_tag("Participation goal: 6% SDVOB.")["participation_goals"] == "SDVOB 6%"
+
+
+def test_due_date_is_the_proposal_date_not_questions_conference_or_issue():
+    assert ingest.regex_tag(DASNY_LIKE)["due_date"] == "2026-02-02"
+    only_other = "Issue Date: December 15, 2025 / Questions Deadline: January 20, 2026 / Pre-Proposal Conference deadline: January 8, 2026"
+    assert ingest.regex_tag(only_other)["due_date"] is None
+    assert ingest.regex_tag("Questions due January 20, 2026; proposals due February 2, 2026.")["due_date"] == "2026-02-02"
+
+
+def test_llm_prompt_carries_the_due_date_and_goals_rules():
+    assert "never the questions deadline" in ingest._LLM_SYSTEM and "participation_goals" in ingest._LLM_SYSTEM
+    assert "participation_goals" in ingest._LLM_SCHEMA["required"]
+
+
+def test_goals_are_requested_only_when_a_gap_fill_call_happens_anyway():
+    llm = FakeLLM()
+    ingest.tag_solicitation(SAMPLE_TEXT, llm)
+    assert llm.calls == []
+    llm = FakeLLM({"participation_goals": "MBE 18%"})
+    tags, filled = ingest.tag_solicitation("NAICS 541512. Proposals are due soon.", llm)
+    assert tags["participation_goals"] == "MBE 18%" and "participation_goals" in filled
+
+
+def test_demo_label_route(client, monkeypatch):
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "adm1n")
+    sid = client.post("/solicitations", json={"text": DASNY_LIKE}).json()["id"]
+    url = f"/solicitations/{sid}/demo-label"
+    body = {"demo": True, "title": "DASNY RFP 7628 (real closed NYS RFP; due date shifted)", "due_date": "2026-12-19",
+            "set_aside": None, "participation_goals": "MBE 18%, WBE 12%, SDVOB 6%"}
+    assert client.post(url, json=body).status_code == 401
+    assert client.post(url, json=body, headers={"X-Admin-Key": "wrong"}).status_code == 401
+    assert client.post("/solicitations/nope/demo-label", json=body, headers={"X-Admin-Key": "adm1n"}).status_code == 404
+    assert client.post(url, json={"due_date": "2026-12-19"}, headers={"X-Admin-Key": "adm1n"}).status_code == 422  # demo is required
+    assert client.post(url, json={**body, "due_date": "soon"}, headers={"X-Admin-Key": "adm1n"}).status_code == 422
+    r = client.post(url, json=body, headers={"X-Admin-Key": "adm1n"})
+    assert r.status_code == 200
+    got = r.json()
+    assert (got["title"], got["due_date"], got["set_aside"], got["participation_goals"]) == (
+        body["title"], "2026-12-19", None, "MBE 18%, WBE 12%, SDVOB 6%")
+    assert sid in [d["id"] for d in client.get("/demo/solicitations").json()]  # the seeded demo row is there too
+    # omitted fields are untouched; demo=false unlabels
+    r = client.post(url, json={"demo": False}, headers={"X-Admin-Key": "adm1n"}).json()
+    assert r["title"] == body["title"] and r["due_date"] == "2026-12-19"
+    assert sid not in [d["id"] for d in client.get("/demo/solicitations").json()]
+
+
+def test_demo_label_rejects_everything_when_admin_key_unset(client, monkeypatch):
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "")
+    sid = client.post("/solicitations", json={"text": SAMPLE_TEXT}).json()["id"]
+    assert client.post(f"/solicitations/{sid}/demo-label", json={"demo": True}, headers={"X-Admin-Key": ""}).status_code == 401

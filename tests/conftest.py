@@ -13,16 +13,23 @@ def tmp_db(tmp_path, monkeypatch):
     return tmp_path / "test.sqlite3"
 
 
-def fake_pp(verified: int):
-    """Stand-in for matrix.assess_past_performance returning `verified` verified matches."""
-    entry = {"client": "C", "scope": "S", "verified": True}
-    return lambda firm, sol, llm: {"verified": [{"client": "C", "quote": "S", "entry": entry}] * verified, "size": ""}
+REAL_VALIDATE_MATCHES = go_no_go.validate_matches
+
+
+def claimed(n: int) -> list[dict]:
+    """`n` model-claimed verified_matches for entry indexes 0..n-1."""
+    return [{"entry_index": i, "why": "scope matches"} for i in range(n)]
 
 
 @pytest.fixture(autouse=True)
-def three_verified_matches(monkeypatch):
-    """Go/no-go tests that are not about the floor see enough matches to leave the model verdict alone."""
-    monkeypatch.setattr(go_no_go, "assess_past_performance", fake_pp(3))
+def lenient_matches(monkeypatch):
+    """Go/no-go tests that are not about match validation count every claimed match, so the model verdict is left alone."""
+    monkeypatch.setattr(go_no_go, "validate_matches", lambda matches, firm: ([m.model_dump() for m in matches], []))
+
+
+@pytest.fixture
+def real_validation(monkeypatch):
+    monkeypatch.setattr(go_no_go, "validate_matches", REAL_VALIDATE_MATCHES)
 
 
 def rows(sql, params=()):

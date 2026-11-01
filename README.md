@@ -53,7 +53,7 @@ Port 8003 avoids the usual 8000–8002 collisions on the dev machine. Migrations
 | `CIVICPROCUREBOT_API_KEY` | – | Sent as `X-API-Key` (assumed header; see `app/shortlist.py`) |
 | `SAM_API_KEY` | – | Only for `sam_notice_id` ingestion |
 | `DB_PATH` | `data/rfp_copilot.sqlite3` | SQLite file (local dev) |
-| `COPILOT_ADMIN_KEY` | – | Required `X-API-Key` for `POST /agent/run-daily`; blank means the endpoint rejects everything |
+| `COPILOT_ADMIN_KEY` | – | Required `X-API-Key` for `POST /agent/run-daily` and `X-Admin-Key` for `POST /solicitations/{id}/demo-label`; blank means the endpoint rejects everything |
 | `MAX_RUN_INPUT_TOKENS` | `60000` | Token guard: a run whose first-call input exceeds this stops with `step_failed` |
 | `PRICE_IN_PER_MTOK` / `PRICE_OUT_PER_MTOK` | `0.50` / `2.00` | USD per million tokens for `est_cost_usd`. Assumed rates: set Meta's actual pricing |
 
@@ -66,16 +66,25 @@ Do not wrap values in quotes in Railway or `.env`.
   - multipart with a PDF in field `file`
   - JSON `{"sam_notice_id": "..."}`
 
-  Returns the tagged record (`due_date`, `naics`, `set_aside`, `place_of_performance`, `section_c/l/m`, `file_id`, and `llm_filled`, the list of fields the model had to fill because regex missed them).
+  Returns the tagged record (`due_date`, `naics`, `set_aside`, `participation_goals`, `place_of_performance`, `section_c/l/m`, `file_id`, and `llm_filled`, the list of fields the model had to fill because regex missed them).
 - `GET /solicitations/{id}`
 - `GET /shortlist/today?firm_id=` — CivicProcureBot proxy
 - `POST /agent/run` `{firm_id, solicitation_id, override_no_bid: false}` — Server-Sent Events: go/no-go, then matrix, narrative, capability statement. A `no_bid` verdict stops after go/no-go (reasons in `decision` and `run_complete`) unless `override_no_bid` is true. Events: `run_started`, `step_started`, `tool_call`, `tool_result`, `decision`, `matrix_row`, `narrative`, `capability_statement`, `step_failed`, `run_complete`; each carries `seq` and `timestamp`. The token guard counts input tokens first and stops with `step_failed` above `MAX_RUN_INPUT_TOKENS`.
 - `GET /runs/{run_id}` — the stored event log of a run, for replay with no model spend. Every `llm_calls` row carries its `run_id`; estimated cost is logged per run.
 - `POST /agent/run-daily` `{firm_id}` with header `X-API-Key` — pulls the CivicProcureBot shortlist, ingests the top 3 by score, runs the full chain on each, and returns a summary list. It never sends email.
 - `GET /demo/solicitations`
+- `POST /solicitations/{id}/demo-label` `{demo, title?, due_date?, set_aside?, participation_goals?}` with header `X-Admin-Key` (= `COPILOT_ADMIN_KEY`) — sets `demo` and the given fields; an omitted field is untouched, a field sent as `null` is cleared.
 - `GET /health`
 
 Tagging is regex first (Sections C/L/M, due date, NAICS, set-aside, place of performance); a single structured-output Muse Spark call fills only the gaps and never overwrites a regex hit. If that call fails, the regex result is stored as-is.
+
+- `set_aside` is a category the contract is restricted to (HUBZone, 8(a), SDVOSB, WOSB, small business). Utilization goals such as "MBE 18%, WBE 12%, SDVOB 6%" are not a set-aside; they go in `participation_goals`.
+- `due_date` is the proposal/response due date. Questions deadlines, pre-proposal conferences and issue dates never qualify; when only those are present the regex pass leaves it empty and the model fills it.
+- State and local solicitations have no federal Section C/L/M labels. The model maps their scope, submission instructions and evaluation criteria onto C, L and M, and `llm_filled` records which fields it filled.
+
+## Go/no-go past-performance floor
+
+The model returns `verified_matches` (`{entry_index, why}`) for the past-performance entries it relied on; `entry_index` is shown in `get_firm_profile` and `search_past_performance`. Code keeps only entries whose index exists, is unique, and has `verified=true`; the rest go to `rejected_matches` with a reason. The floor counts the kept list: 0 forces `no_bid` (score cap 35), 1-2 cap at `needs_review` (score cap 65), 3+ leave the verdict alone, and hard blockers force `no_bid`. Both lists are stored on the decision and returned in `decision`.
 
 ## Voice intake
 
@@ -94,6 +103,8 @@ Smoke test (one real call): `python scripts/voice_smoke.py <audio> [firm_id] [--
 ## Demo data
 
 **Demo firms and demo solicitations are fictional.** Firms 2 and 3 (`demo=true`) and the seeded county facilities electrical maintenance solicitation (NAICS 238210, HUBZone set-aside, Syracuse) are invented for demonstration; none of their clients, contracts, values or references are real. Firm 2 carries three `verified=true` past-performance entries that match the demo solicitation, so a run on it reaches a `bid` or `needs_review` verdict. Firm 1 is the only real firm.
+
+The DASNY RFP 7628 (Small Business Capacity Building Services) demo solicitation is a real, closed NYS RFP with its due date shifted forward, and its title says so. It is labelled with `POST /solicitations/{id}/demo-label`, not by editing the database.
 
 ## Tests
 

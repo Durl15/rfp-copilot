@@ -10,12 +10,13 @@ from app.llm.meta_client import MetaClient
 from app.main import app
 from app.routes import get_llm
 from app.seed import DEMO_SOLICITATION_ID, seed_firms
-from tests.conftest import SAMPLE_TEXT, fake_pp, rows
+from tests.conftest import SAMPLE_TEXT, rows
 from tests.test_agent import FINAL, FakeSDK, _final, _message, _response, _solicitation, _tool_turn
 from tests.test_day4b import STATEMENT, _text
 from tests.test_matrix import GOOD_ROWS, _matrix_final
 
 BAD = _response("bad", _message("not json"))
+NO_MATCHES = {**FINAL, "verified_matches": []}
 
 
 def _llm(*responses, tokens=1000):
@@ -87,8 +88,7 @@ def test_bid_path_event_order():
 
 def test_no_bid_stops_after_go_no_go_and_emits_reasons(monkeypatch):
     seed_firms()
-    monkeypatch.setattr(go_no_go, "assess_past_performance", fake_pp(0))
-    llm, sdk = _llm(_final("g"))
+    llm, sdk = _llm(_final("g", NO_MATCHES))
     events = post_run(llm, sol_id=_solicitation())
     assert names(events)[-3:] == ["step_started", "decision", "run_complete"]
     assert "matrix" not in [e.get("step") for e in events]
@@ -100,8 +100,7 @@ def test_no_bid_stops_after_go_no_go_and_emits_reasons(monkeypatch):
 
 def test_override_no_bid_continues_the_chain(monkeypatch):
     seed_firms()
-    monkeypatch.setattr(go_no_go, "assess_past_performance", fake_pp(0))
-    llm, _ = _llm(_final("g"), *bid_script()[2:])
+    llm, _ = _llm(_final("g", NO_MATCHES), *bid_script()[2:])
     events = post_run(llm, sol_id=_solicitation(), override_no_bid=True)
     assert names(events)[-1] == "run_complete" and "capability_statement" in names(events)
     assert events[-1]["verdict"] == "no_bid" and events[-1]["export_url"]
@@ -176,11 +175,10 @@ def test_run_daily_rejects_missing_wrong_or_unconfigured_key(monkeypatch, header
 
 def test_run_daily_runs_top_three_by_score(monkeypatch):
     seed_firms()
-    monkeypatch.setattr(go_no_go, "assess_past_performance", fake_pp(0))
     items = [{"score": s, "text": SAMPLE_TEXT} for s in (40, 90, 10, 70)]
     seen = {}
     monkeypatch.setattr("app.agent.run.fetch_shortlist", lambda firm_id: seen.update(firm_id=firm_id) or {"matches": items})
-    llm, sdk = _llm(_final("a"), _final("b"), _final("c"))
+    llm, sdk = _llm(_final("a", NO_MATCHES), _final("b", NO_MATCHES), _final("c", NO_MATCHES))
     r = _daily(monkeypatch, llm, {"X-API-Key": "s3cret"})
     assert r.status_code == 200 and seen["firm_id"] == "1"
     runs = r.json()["runs"]
@@ -203,19 +201,11 @@ def test_demo_data_and_endpoint():
     assert len(rows("SELECT * FROM solicitations WHERE demo = 0")) == 0
 
 
-def test_demo_firm_2_reaches_bid_or_needs_review(monkeypatch):
+def test_demo_firm_2_reaches_bid_or_needs_review(real_validation):
     seed_firms()
-    monkeypatch.setattr(go_no_go, "assess_past_performance", matrix.assess_past_performance)
-    terms = ["electrical maintenance", "preventive maintenance", "panelboard repair", "emergency lighting"]
-    llm, _ = _llm(
-        _final("g", {**FINAL, "verdict": "bid"}),
-        _final("s", {"terms": terms, "size_indicator": ""}),
-        _final("m1", {"relevant": True, "matched_terms": terms[1:3], "quote": "preventive maintenance"}),
-        _final("m2", {"relevant": True, "matched_terms": [terms[0], terms[2]], "quote": "panelboard repair"}),
-        _final("m3", {"relevant": True, "matched_terms": [terms[1], terms[3]], "quote": "emergency lighting"}),
-    )
-    d = go_no_go.run_go_no_go(2, DEMO_SOLICITATION_ID, llm)["decision"]
+    d = go_no_go.run_go_no_go(2, DEMO_SOLICITATION_ID, _llm(_final("g", {**FINAL, "verdict": "bid"}))[0])["decision"]
     assert d["verdict"] in ("bid", "needs_review") and d["verdict_source"] == "model"
+    assert [m["entry_index"] for m in d["verified_matches"]] == [0, 1, 2] and d["rejected_matches"] == []
 
 
 def test_narrative_keeps_the_size_standard_dollar_sign():

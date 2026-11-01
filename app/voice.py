@@ -31,13 +31,17 @@ ASR_MODEL = "muse-voice-transcribe-1.0"
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 ASR_TIMEOUT_S = 180
 FFMPEG_TIMEOUT_S = 120
-EXTRACT_TOKENS = 1500
+EXTRACT_TOKENS = 3000
+QUOTE_SEP = " | "
 FIELDS = ("client", "scope", "value_range", "dates", "role", "outcome", "reference")
 EXTRACT_PROMPT = (
     "You turn the transcript of a voice note into ONE past-performance entry. Fields: client, scope, value_range, dates, "
     "role, outcome, reference. For every field the speaker actually stated, give the value and, in evidence, one quote "
     "copied character for character from the transcript that supports it. A field the speaker did not state is null, "
-    "with a null evidence quote. Never guess, infer or fill in. The first sentence is often a preamble such as \"this is a past "
+    "with a null evidence quote. scope is what was built, delivered or performed (the deliverables and activities), not the "
+    "engagement or project title; list every deliverable the speaker named. dates captures every time reference in the note: "
+    "duration, start, end and expected completion. If a field draws on several places in the transcript, give the quotes "
+    "separated by \" | \", each copied verbatim. Never guess, infer or fill in. The first sentence is often a preamble such as \"this is a past "
     "performance note for <firm>\": that firm is the speaker, never the client. Reply with the JSON only."
 )
 HINTS_RULE = (
@@ -59,7 +63,9 @@ def _norm(s: str) -> str:
 
 
 def check_evidence(transcript: str, entry: dict, evidence: dict) -> list[str]:
-    """Every non-null entry field needs a non-empty quote that appears verbatim (whitespace/case-insensitive) in the transcript."""
+    """Every non-null entry field needs a non-empty quote that appears verbatim (whitespace/case-insensitive) in the transcript.
+
+    A field may cite several places: quotes joined by " | " must each appear verbatim."""
     hay = _norm(transcript)
     problems = []
     for f in FIELDS:
@@ -69,7 +75,7 @@ def check_evidence(transcript: str, entry: dict, evidence: dict) -> list[str]:
         quote = evidence.get(f)
         if not quote or not quote.strip():
             problems.append(f"{f}: no supporting quote")
-        elif _norm(quote) not in hay:
+        elif not all(_norm(q) in hay for q in quote.split(QUOTE_SEP) if q.strip()):
             problems.append(f"{f}: quote not found verbatim in the transcript")
     return problems
 
@@ -151,7 +157,7 @@ def transcribe(audio: bytes, filename: str, content_type: str | None, run_id: st
 
 
 def extract_entry(transcript: str, llm: MetaClient, hints: str | None = None) -> tuple[dict, dict]:
-    """One structured call (effort low); one retry with the failed checks fed back, then ValueError."""
+    """One structured call (effort minimal); one retry with the failed checks fed back, then ValueError."""
     hints = (hints or "").strip()
     system = EXTRACT_PROMPT + (HINTS_RULE if hints else "")
     first = {"role": "user", "content": f"transcript:\n{transcript}" + (f"\n\nhints: {hints}" if hints else "")}
@@ -159,7 +165,7 @@ def extract_entry(transcript: str, llm: MetaClient, hints: str | None = None) ->
     problems: list[str] = []
     for _ in range(2):
         res = llm.complete(messages, system=system, json_schema=EXTRACT_SCHEMA, schema_name="voice_entry",
-                           reasoning_effort="low", feature="voice_extract", max_tokens=EXTRACT_TOKENS)
+                           reasoning_effort="minimal", feature="voice_extract", max_tokens=EXTRACT_TOKENS)
         parsed = res.parsed
         if not (isinstance(parsed, dict) and isinstance(parsed.get("entry"), dict) and isinstance(parsed.get("evidence"), dict)):
             problems = [res.parse_error or "no valid JSON answer returned"]

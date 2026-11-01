@@ -1,10 +1,12 @@
+import hmac
 import json
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, model_validator
 
-from app import ingest
+from app import db, ingest
+from app.config import get_settings
 from app.llm.meta_client import MetaClient
 
 router = APIRouter()
@@ -74,3 +76,32 @@ def read_solicitation(sol_id: str):
     if not row:
         raise HTTPException(404, "not found")
     return _public(row)
+
+
+class DemoLabelIn(BaseModel):
+    title: str | None = None
+    due_date: str | None = None
+    set_aside: str | None = None
+    participation_goals: str | None = None
+    demo: bool
+
+
+@router.post("/solicitations/{sol_id}/demo-label")
+def demo_label(sol_id: str, body: DemoLabelIn, x_admin_key: str | None = Header(None)):
+    """Mark a solicitation as a demo and override the given fields. A field sent as null is cleared; an omitted field is untouched."""
+    key = get_settings().copilot_admin_key
+    if not key or not x_admin_key or not hmac.compare_digest(x_admin_key.encode(), key.encode()):
+        raise HTTPException(401, "invalid or missing X-Admin-Key")
+    if not ingest.get_solicitation(sol_id):
+        raise HTTPException(404, "not found")
+    fields = {k: getattr(body, k) for k in body.model_fields_set if k != "demo"}
+    if fields.get("title", "") is None:
+        raise HTTPException(422, "title cannot be cleared")
+    if fields.get("due_date"):
+        fields["due_date"] = ingest._norm_date(fields["due_date"])
+        if not fields["due_date"]:
+            raise HTTPException(422, "due_date must be a date such as 2026-12-19")
+    fields["demo"] = int(body.demo)
+    with db.session() as conn:
+        conn.execute(f"UPDATE solicitations SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), sol_id))
+    return _public(ingest.get_solicitation(sol_id))

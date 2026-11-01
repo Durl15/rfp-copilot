@@ -76,7 +76,7 @@ def test_transcript_to_entry_with_valid_quotes():
     body = r.json()
     assert body["transcript"] == TRANSCRIPT and body["entry"]["client"] == "Onondaga County" and body["entry"]["verified"] is False
     assert all(q is None or q in TRANSCRIPT for q in body["evidence"].values())
-    assert llm.calls[0]["reasoning_effort"] == "low"
+    assert (llm.calls[0]["reasoning_effort"], llm.calls[0]["max_tokens"]) == ("minimal", 3000)
     assert rows("SELECT verified FROM pending_entries") == [{"verified": 0}]
 
 
@@ -219,11 +219,16 @@ def test_route_stores_duration_and_raw_response(monkeypatch):
 
 
 WOODFORK = (Path(__file__).parent / "fixtures" / "voice_transcript_woodfork.txt").read_text(encoding="utf-8")
-W_ENTRY = {"client": "The Woodfork Group", "scope": "East Adams RFQ project and the City MWBE project", "value_range": None,
-           "dates": "four months; late February 2027", "role": "AI platform development and staff training",
+W_ENTRY = {"client": "The Woodfork Group",
+           "scope": "Built the administrative platform and the client portal; the portal helped MWBEs find and respond to bids; "
+                    "improved business processes; trained staff to use them",
+           "value_range": None, "dates": "four months; late February 2027", "role": "AI platform development and staff training",
            "outcome": "faster bid turnaround", "reference": "Terry Woodfork"}
-W_QUOTES = {"client": "The client was the Woodford Group", "scope": "East Adam RFQ project and the City MWBE project", "value_range": None,
-            "dates": "Over four months", "role": "AI platform development and and staff training", "outcome": "faster faster bid turnaround",
+W_QUOTES = {"client": "The client was the Woodford Group",
+            "scope": "built both the administrative platform and the client portal | find and respond to bids | improving business processes"
+                     " | training their people",
+            "value_range": None, "dates": "Over four months | looking for completion in late February 2027",
+            "role": "AI platform development and and staff training", "outcome": "faster faster bid turnaround",
             "reference": "Terry Woodford president of the Woodford Group"}
 
 
@@ -244,3 +249,20 @@ def test_preamble_firm_is_not_the_client():
     assert voice.check_evidence(WOODFORK, bad, {**W_QUOTES, "client": "note for DJ AI business consultant"}) == []
     entry, _ = voice.extract_entry(WOODFORK, FakeLLM(good(W_ENTRY, W_QUOTES)))
     assert "DJ AI" not in entry["client"] and entry["value_range"] is None
+
+
+def test_woodfork_scope_covers_every_deliverable_and_dates_every_time_reference():
+    llm = FakeLLM(good(W_ENTRY, W_QUOTES))
+    entry, evidence = voice.extract_entry(WOODFORK, llm, "The Woodfork Group")
+    for part in ("administrative platform", "client portal", "find and respond to bids", "business processes", "train"):
+        assert part in entry["scope"]
+    assert "four months" in entry["dates"] and "late February 2027" in entry["dates"]
+    assert voice.check_evidence(WOODFORK, entry, evidence) == []
+    assert "not the engagement or project title" in voice.EXTRACT_PROMPT and "every time reference" in voice.EXTRACT_PROMPT
+    assert llm.calls[0]["max_tokens"] == 3000 and llm.calls[0]["reasoning_effort"] == "minimal"
+
+
+def test_multi_quote_evidence_requires_every_part_verbatim():
+    entry = {"dates": "x"}
+    assert voice.check_evidence(WOODFORK, entry, {"dates": "Over four months | late February 2027"}) == []
+    assert voice.check_evidence(WOODFORK, entry, {"dates": "Over four months | late March 2027"}) == ["dates: quote not found verbatim in the transcript"]

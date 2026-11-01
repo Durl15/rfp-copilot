@@ -73,7 +73,10 @@ class ToolError(ValueError):
 
 def get_firm_profile(firm_id: int) -> dict:
     firm = firms.get_firm(firm_id)
-    return claims.redact(firm) if firm else {"error": f"firm {firm_id} not found"}
+    if not firm:
+        return {"error": f"firm {firm_id} not found"}
+    firm = claims.redact(firm)
+    return {**firm, "past_performance": [{"entry_index": i, **e} for i, e in enumerate(firm["past_performance"])]}
 
 
 def get_solicitation(solicitation_id: str) -> dict:
@@ -101,11 +104,11 @@ def search_past_performance(firm_id: int, keywords: list[str]) -> dict:
     firm = claims.redact(firm)
     kws = [k for k in (k.lower().strip() for k in keywords) if k and k not in STOPWORDS]
     matches = []
-    for entry in firm["past_performance"]:
+    for i, entry in enumerate(firm["past_performance"]):
         haystack = " ".join(str(v) for v in entry.values()).lower()
         hit = [k for k in kws if k in haystack]
         if hit:
-            matches.append({**entry, "matched_keywords": hit})
+            matches.append({"entry_index": i, **entry, "matched_keywords": hit})
     return {"firm_id": firm_id, "total_entries": len(firm["past_performance"]), "matches": matches}
 
 
@@ -124,13 +127,14 @@ def estimate_effort(gap_counts: dict[str, int]) -> dict:
 def record_decision(
     solicitation_id: str, firm_id: int, verdict: str, score: int, reasons: list[str],
     verdict_source: str = "model", rule_reason: str = "",
+    verified_matches: list[dict] | None = None, rejected_matches: list[dict] | None = None,
 ) -> dict:
     with db.session() as conn:
         cur = conn.execute(
-            "INSERT INTO decisions (created_at, solicitation_id, firm_id, verdict, score, reasons, verdict_source, rule_reason)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO decisions (created_at, solicitation_id, firm_id, verdict, score, reasons, verdict_source, rule_reason,"
+            " verified_matches, rejected_matches) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (datetime.now(timezone.utc).isoformat(), solicitation_id, firm_id, verdict, score, json.dumps(reasons),
-             verdict_source, rule_reason),
+             verdict_source, rule_reason, json.dumps(verified_matches or []), json.dumps(rejected_matches or [])),
         )
     return {"decision_id": cur.lastrowid}
 

@@ -180,6 +180,14 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE pending_entries ADD COLUMN raw_response TEXT;
         """,
     ),
+    (
+        11,
+        """
+        ALTER TABLE decisions ADD COLUMN verified_matches TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE decisions ADD COLUMN rejected_matches TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE solicitations ADD COLUMN participation_goals TEXT;
+        """,
+    ),
 ]
 
 

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app import claims, firms, ingest
 from app.agent import tools
 from app.agent.events import noop
-from app.agent.matrix import PP_NONE_MIN as PP_CLEAR_MIN, assess_past_performance
+from app.agent.matrix import PP_NONE_MIN as PP_CLEAR_MIN
 from app.llm.conversation import Conversation
 from app.llm.meta_client import MetaClient
 from app.routes import get_llm
@@ -31,17 +31,25 @@ SYSTEM_PROMPT = (
     "blockers lists ONLY hard disqualifiers: a required certification the firm lacks, a set-aside the firm does not "
     "qualify for, a NAICS code outside the firm's codes, or a due date that has already passed. Weak fit, thin past "
     "performance, or effort concerns are NOT blockers; put them in top_reasons. "
+    "Past-performance entries carry an entry_index. verified_matches lists ONLY the entries you relied on as "
+    "scope-relevant to this solicitation, each as {entry_index, why} with why one sentence; list an entry only if its "
+    "scope matches the work, and use [] if none do. "
     "Past-performance entries with verified false show relevance only: never count them as proof of capability, and say "
     "in top_reasons what proof the firm must supply. "
     "top_reasons has at most 3 entries and the FIRST must be the single decisive factor behind the verdict. "
     "Score 0-100 for fit (70+ bid, 40-69 needs_review, below 40 no_bid unless a blocker says otherwise). "
-    "Code enforces a past-performance floor after you answer, counting only verified past-performance entries that match "
-    "the scope of work: zero verified matches forces no_bid and caps the score at 35; one or two force needs_review at "
+    "Code enforces a past-performance floor after you answer, counting only the entries in verified_matches that exist "
+    "and have verified true: zero verified matches forces no_bid and caps the score at 35; one or two force needs_review at "
     "most and cap the score at 65; three or more leave your verdict unchanged. Hard blockers always force no_bid. "
     "Keep your verdict, score and reasons consistent with this rule. "
     "rationale_for_verdict is ONE sentence explaining why the verdict is bid, needs_review, or no_bid rather than the other two. "
     "When you have enough information, reply with the final JSON decision only."
 )
+
+
+class VerifiedMatch(BaseModel):
+    entry_index: int
+    why: str
 
 
 class GoNoGo(BaseModel):
@@ -53,6 +61,7 @@ class GoNoGo(BaseModel):
     estimated_effort_hours: int = Field(ge=0)
     set_aside_match: bool
     naics_match: bool
+    verified_matches: list[VerifiedMatch]
 
     @field_validator("top_reasons")
     @classmethod
@@ -76,15 +85,46 @@ GO_NO_GO_SCHEMA = {
         "estimated_effort_hours": {"type": "integer"},
         "set_aside_match": {"type": "boolean"},
         "naics_match": {"type": "boolean"},
+        "verified_matches": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "entry_index": {"type": "integer", "description": "entry_index of a past-performance entry"},
+                    "why": {"type": "string", "description": "One sentence: how the entry's scope matches this solicitation"},
+                },
+                "required": ["entry_index", "why"],
+                "additionalProperties": False,
+            },
+            "description": "Only the past-performance entries relied on as scope-relevant; [] if none",
+        },
     },
     "required": list(GoNoGo.model_fields),
     "additionalProperties": False,
 }
 
 
+def validate_matches(matches: list[VerifiedMatch], firm: dict) -> tuple[list[dict], list[dict]]:
+    """Split model-claimed matches into (kept, rejected): the index must exist on the firm, be unique, and be verified."""
+    entries = firm["past_performance"]
+    kept, rejected, seen = [], [], set()
+    for m in matches:
+        item = {"entry_index": m.entry_index, "why": m.why}
+        if not 0 <= m.entry_index < len(entries):
+            rejected.append({**item, "reason": f"entry_index {m.entry_index} does not exist (firm has {len(entries)} entries)"})
+        elif m.entry_index in seen:
+            rejected.append({**item, "reason": "duplicate entry_index"})
+        elif not claims.is_verified(entries[m.entry_index]):
+            rejected.append({**item, "reason": "entry is not verified"})
+        else:
+            seen.add(m.entry_index)
+            kept.append(item)
+    return kept, rejected
+
+
 def apply_floor(decision: GoNoGo, verified: int) -> dict:
     """The decision as a dict with the code-enforced floor applied; verdict_source is 'rule' only when the verdict changed."""
-    out = decision.model_dump()
+    out = decision.model_dump(exclude={"verified_matches"})
     verdict, score, reason = decision.verdict, decision.score, ""
     if decision.blockers:
         verdict, reason = "no_bid", "Hard blocker: " + "; ".join(decision.blockers)
@@ -148,12 +188,12 @@ def run_go_no_go(firm_id: int, solicitation_id: str, llm: MetaClient, emit=noop)
             except ValidationError as exc:
                 problem = f"answer failed validation: {exc.error_count()} error(s)"
                 break
-            pp = assess_past_performance(firms.get_firm(firm_id), ingest.get_solicitation(solicitation_id), llm)
-            verified = sum(claims.is_verified(m["entry"]) for m in pp["verified"])
-            out = apply_floor(decision, verified)
+            kept, rejected = validate_matches(decision.verified_matches, firms.get_firm(firm_id))
+            out = {**apply_floor(decision, len(kept)), "verified_matches": kept, "rejected_matches": rejected}
             reasons = out["top_reasons"] + [f"BLOCKER: {b}" for b in decision.blockers]
             saved = tools.record_decision(
                 solicitation_id, firm_id, out["verdict"], out["score"], reasons, out["verdict_source"], out["rule_reason"],
+                kept, rejected,
             )
             emit("decision", payload=out)
             return {"decision": out, "decision_id": saved["decision_id"], "trace": trace}

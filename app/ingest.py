@@ -15,7 +15,7 @@ from app.llm.meta_client import MetaClient
 log = logging.getLogger(__name__)
 
 SAM_SEARCH_URL = "https://api.sam.gov/prod/opportunities/v2/search"
-FIELDS = ("section_c", "section_l", "section_m", "due_date", "naics", "set_aside", "place_of_performance")
+FIELDS = ("section_c", "section_l", "section_m", "due_date", "naics", "set_aside", "participation_goals", "place_of_performance")
 LLM_TEXT_LIMIT = 60_000
 
 # ---------------------------------------------------------------- extraction
@@ -100,10 +100,24 @@ _DUE_RE = re.compile(
     rf"[^\n]{{0,80}}?({_DATE_RE})",
     re.I,
 )
+# Date labels that never mean "proposals due": Q&A deadlines, conferences, site visits, issue/posting dates.
+_NOT_DUE_RE = re.compile(
+    r"question|inquir|q\s*&\s*a|conference|site\s+visit|walk-?through|intent|\bissu|releas|posted|pre-?(?:proposal|bid)", re.I
+)
+_PROPOSAL_DUE_RE = re.compile(r"proposal|offer|bid|response|submission|receipt", re.I)
+_CONTEXT_CHARS = 60
 _NAICS_RE = re.compile(r"NAICS(?:\s+code)?[^\d\n]{0,20}(\d{6})", re.I)
 _TITLE_RE = re.compile(r"^[ \t]*title[ \t]*:[ \t]*(\S[^\n]*)$", re.I | re.M)
 TITLE_MAX = 200
 _POP_RE = re.compile(r"place\s+of\s+performance\s*[:\-]\s*([^\n]{3,200})", re.I)
+# Participation/utilization goals ("MBE 18%", "6% SDVOB") are not set-asides.
+_GOAL_RE = re.compile(
+    r"\b(MWBE|MBE|WBE|SDVOSB|SDVOB|DBE|DVBE)\b[^\n\d%]{0,40}?(\d{1,2}(?:\.\d+)?)\s*(?:%|percent)"
+    r"|(\d{1,2}(?:\.\d+)?)\s*(?:%|percent)\s*(?:for\s+|to\s+)?(MWBE|MBE|WBE|SDVOSB|SDVOB|DBE|DVBE)\b",
+    re.I,
+)
+_GOAL_CONTEXT_RE = re.compile(r"goal|participation|utiliz|\d\s*%|percent", re.I)
+_SET_ASIDE_WORD_RE = re.compile(r"set[- ]?aside", re.I)
 _SET_ASIDES = (
     (r"HUBZone", "HUBZone"),
     (r"8\(a\)", "8(a)"),
@@ -113,6 +127,38 @@ _SET_ASIDES = (
     (r"total\s+small\s+business|small\s+business\s+set[- ]aside", "Small Business"),
     (r"full\s+and\s+open", "Full and Open"),
 )
+
+
+def _is_set_aside(text: str, m: re.Match) -> bool:
+    """A category mention is a set-aside unless it sits in goal/percentage language and not next to 'set-aside'."""
+    context = text[max(0, m.start() - 80):m.end() + 80]
+    return bool(_SET_ASIDE_WORD_RE.search(context)) or not _GOAL_CONTEXT_RE.search(context)
+
+
+def _participation_goals(text: str) -> str | None:
+    goals: list[str] = []
+    for m in _GOAL_RE.finditer(text):
+        cat, pct = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+        goal = f"{cat.upper()} {pct}%"
+        if goal not in goals:
+            goals.append(goal)
+    return ", ".join(goals) or None
+
+
+def _due_date(text: str) -> str | None:
+    """First date labelled as a proposal/response due date; Q&A, conference and issue dates never qualify."""
+    fallback, prev_end = None, 0
+    for m in _DUE_RE.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        context = text[max(line_start, prev_end, m.start() - _CONTEXT_CHARS):m.end()]
+        prev_end = m.end()
+        d = _norm_date(m.group(1))
+        if not d or _NOT_DUE_RE.search(context):
+            continue
+        if _PROPOSAL_DUE_RE.search(context):
+            return d
+        fallback = fallback or d
+    return fallback
 
 
 def _norm_date(s: str) -> str | None:
@@ -155,16 +201,14 @@ def regex_tag(text: str) -> dict:
     out["title"] = _title(text)
     secs = _sections(text)
     out["section_c"], out["section_l"], out["section_m"] = secs.get("C"), secs.get("L"), secs.get("M")
-    for m in _DUE_RE.finditer(text):
-        if d := _norm_date(m.group(1)):
-            out["due_date"] = d
-            break
+    out["due_date"] = _due_date(text)
+    out["participation_goals"] = _participation_goals(text)
     if m := _NAICS_RE.search(text):
         out["naics"] = m.group(1)
     if m := _POP_RE.search(text):
         out["place_of_performance"] = m.group(1).strip()
     for pat, label in _SET_ASIDES:
-        if re.search(pat, text, re.I):
+        if any(_is_set_aside(text, m) for m in re.finditer(pat, text, re.I)):
             out["set_aside"] = label
             break
     return out
@@ -178,7 +222,8 @@ _LLM_SCHEMA = {
         "section_m": {"type": ["string", "null"], "description": "Evaluation factors (Section M), tight excerpt"},
         "due_date": {"type": ["string", "null"], "description": "Date offers are due, YYYY-MM-DD"},
         "naics": {"type": ["string", "null"], "description": "6-digit NAICS code"},
-        "set_aside": {"type": ["string", "null"]},
+        "set_aside": {"type": ["string", "null"], "description": "Category the contract is restricted to (HUBZone, 8(a), SDVOSB, WOSB, small business, MWBE set-aside), else null"},
+        "participation_goals": {"type": ["string", "null"], "description": "Utilization/participation goals, e.g. \"MBE 18%, WBE 12%, SDVOB 6%\", else null"},
         "place_of_performance": {"type": ["string", "null"]},
     },
     "required": list(FIELDS),
@@ -187,15 +232,22 @@ _LLM_SCHEMA = {
 _LLM_SYSTEM = (
     "You extract structured fields from US federal and state solicitations. "
     "Fill ONLY the requested fields. Use null when the document does not state the value; never guess. "
-    "For due_date, choose the date proposals/offers are due, not issue, Q&A, or period-of-performance dates."
+    "For due_date, choose the date proposals/offers are due, never the questions deadline, pre-proposal conference, issue date, or "
+    "period-of-performance dates. "
+    "set_aside is a category the contract is restricted to (HUBZone, 8(a), SDVOSB, WOSB, small business, MWBE set-aside). "
+    "MBE/WBE/SDVOB/DBE utilization or participation goals (e.g. 18%) are NOT a set-aside: leave set_aside null and put them in "
+    "participation_goals. State and local solicitations have no Section C/L/M labels: map their scope of work, submission "
+    "instructions and evaluation criteria onto C, L and M."
 )
 
 
 def fill_gaps(text: str, tags: dict, llm: MetaClient) -> tuple[dict, list[str]]:
     """One structured-output call for fields the regex pass left empty. Failure leaves tags unchanged."""
-    missing = [f for f in FIELDS if not tags.get(f)]
-    if not missing:
+    missing = [f for f in FIELDS if not tags.get(f) and f != "participation_goals"]
+    if not missing:  # goals are absent from most solicitations: ask for them only when a call is happening anyway
         return tags, []
+    if not tags.get("participation_goals"):
+        missing.append("participation_goals")
     prompt = f"Fields to fill: {', '.join(missing)}\n\n<solicitation>\n{text[:LLM_TEXT_LIMIT]}\n</solicitation>"
     try:
         res = llm.complete(
