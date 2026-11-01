@@ -2,6 +2,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
+from app import storage
 from app.config import get_settings
 
 # Append-only. Each entry runs once, in order, and is recorded in schema_migrations.
@@ -206,6 +207,8 @@ def session() -> Iterator[sqlite3.Connection]:
     try:
         yield conn
         conn.commit()
+        if conn.total_changes:
+            storage.schedule_upload()
     except Exception:
         conn.rollback()
         raise

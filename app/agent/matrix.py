@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ValidationError
 
-from app import claims, db, firms, ingest
+from app import claims, db, firms, ingest, limits
 from app.agent import tools
 from app.agent.events import noop
 from app.llm.conversation import Conversation
@@ -469,7 +469,7 @@ class MatrixIn(BaseModel):
     solicitation_id: str
 
 
-@router.post("/agent/matrix")
+@router.post("/agent/matrix", dependencies=[Depends(limits.agent_run_limit)])
 def create_matrix(body: MatrixIn, llm: MetaClient = Depends(get_llm)):
     if not firms.get_firm(body.firm_id):
         raise HTTPException(404, f"firm {body.firm_id} not found")

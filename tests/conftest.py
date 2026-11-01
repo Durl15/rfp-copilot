@@ -1,6 +1,6 @@
 import pytest
 
-from app import db, seed
+from app import db, limits, seed
 from app.agent import go_no_go
 
 
@@ -9,6 +9,9 @@ def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.sqlite3"))
     monkeypatch.setenv("META_MODEL", "muse-spark-1.3")
     monkeypatch.setattr(seed, "PRIVATE_PROFILE", tmp_path / "no_private_profile.json")
+    monkeypatch.delenv("GCS_BUCKET", raising=False)
+    monkeypatch.delenv("MAX_DAILY_RUNS", raising=False)
+    limits.reset()
     db.init_db()
     return tmp_path / "test.sqlite3"
 

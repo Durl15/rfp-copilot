@@ -7,13 +7,14 @@ import json
 import logging
 import queue
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import claims, db, firms, ingest
+from app import claims, db, firms, ingest, limits
 from app.agent import capability, go_no_go, matrix, narrative
 from app.agent.events import Emitter
 from app.config import get_settings
@@ -25,6 +26,8 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 DAILY_TOP_N = 3
+FALLBACK_INGEST_DAYS = 14
+KEEPALIVE_SECONDS = 15
 REASON_CHARS = 500
 TERMINAL_STATUS = {"run_complete": "complete", "step_failed": "failed"}
 
@@ -116,6 +119,11 @@ def execute_run(em: Emitter, firm_id: int, solicitation_id: str, override_no_bid
             return matrix.run_matrix(firm_id, solicitation_id, llm, em)
 
         readiness = _step(em, "matrix", build_matrix)["matrix"]["summary"]["overall_readiness_pct"]
+        if decision["verdict"] == "needs_review":  # narrative and capability statement are for bids (or an explicit no_bid override)
+            export_url = f"/agent/export/{solicitation_id}?firm_id={firm_id}&kind=matrix"
+            out.update(status="complete", readiness_pct=readiness, export_url=export_url, est_cost_usd=run_cost(em.run_id))
+            em("run_complete", export_url=export_url, readiness_pct=readiness, verdict="needs_review", est_cost_usd=out["est_cost_usd"])
+            return out
         _step(em, "narrative", lambda: narrative.run_narrative(firm_id, solicitation_id, llm, em))
         _step(em, "capability_statement", lambda: capability.run_capability(firm_id, solicitation_id, llm, em))
         export_url = f"/agent/export/{solicitation_id}?firm_id={firm_id}&kind=bidpacket"
@@ -126,8 +134,9 @@ def execute_run(em: Emitter, firm_id: int, solicitation_id: str, override_no_bid
     return out
 
 
-def stream_run(firm_id: int, solicitation_id: str, override_no_bid: bool, llm: MetaClient) -> Iterator[dict]:
-    """Run in a worker thread and yield events as they are emitted. The run finishes and is stored even if the client leaves."""
+def stream_run(firm_id: int, solicitation_id: str, override_no_bid: bool, llm: MetaClient) -> Iterator[dict | None]:
+    """Run in a worker thread and yield events as they are emitted, or None every KEEPALIVE_SECONDS of silence.
+    The run finishes and is stored even if the client leaves."""
     q: queue.Queue = queue.Queue()
     em = new_emitter(firm_id, solicitation_id, q.put)
 
@@ -140,12 +149,22 @@ def stream_run(firm_id: int, solicitation_id: str, override_no_bid: bool, llm: M
             q.put(None)
 
     threading.Thread(target=work, daemon=True).start()
-    while (ev := q.get()) is not None:
+    while True:
+        try:
+            ev = q.get(timeout=KEEPALIVE_SECONDS)
+        except queue.Empty:
+            yield None
+            continue
+        if ev is None:
+            return
         yield ev
 
 
-def _sse(events: Iterator[dict]) -> Iterator[str]:
+def _sse(events: Iterator[dict | None]) -> Iterator[str]:
     for ev in events:
+        if ev is None:  # SSE comment: keeps Cloud Run's proxy from idling out a long model call
+            yield ": keepalive\n\n"
+            continue
         yield f"id: {ev['seq']}\nevent: {ev['event']}\ndata: {json.dumps(ev, default=str)}\n\n"
 
 
@@ -155,7 +174,7 @@ class RunIn(BaseModel):
     override_no_bid: bool = False
 
 
-@router.post("/agent/run")
+@router.post("/agent/run", dependencies=[Depends(limits.agent_run_limit)])
 def agent_run(body: RunIn, llm: MetaClient = Depends(get_llm)):
     if not firms.get_firm(body.firm_id):
         raise HTTPException(404, f"firm {body.firm_id} not found")
@@ -208,16 +227,16 @@ class DailyIn(BaseModel):
     firm_id: int
 
 
-@router.post("/agent/run-daily")
-def run_daily(body: DailyIn, x_api_key: str | None = Header(None), llm: MetaClient = Depends(get_llm)):
-    """Pull the shortlist, ingest the top 3 by score, run the chain on each, store results. Never sends email."""
-    key = get_settings().copilot_admin_key
-    if not key or not x_api_key or not hmac.compare_digest(x_api_key.encode(), key.encode()):
-        raise HTTPException(401, "invalid or missing X-API-Key")
-    if not firms.get_firm(body.firm_id):
-        raise HTTPException(404, f"firm {body.firm_id} not found")
-    items = _shortlist_items(fetch_shortlist(str(body.firm_id)))
-    items.sort(key=lambda i: i.get("score") or 0, reverse=True)
+def _fallback_solicitations() -> list[dict]:
+    """Demo solicitations plus anything ingested in the last FALLBACK_INGEST_DAYS days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=FALLBACK_INGEST_DAYS)).isoformat()
+    with db.session() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, title FROM solicitations WHERE demo = 1 OR created_at >= ? ORDER BY created_at DESC, id", (cutoff,)
+        )]
+
+
+def _daily_runs(firm_id: int, items: list[dict], llm: MetaClient) -> list[dict]:
     results = []
     for item in items[:DAILY_TOP_N]:
         try:
@@ -225,7 +244,40 @@ def run_daily(body: DailyIn, x_api_key: str | None = Header(None), llm: MetaClie
         except Exception as exc:
             results.append({"score": item.get("score"), "status": "ingest_failed", "reason": f"{type(exc).__name__}: {exc}"[:REASON_CHARS]})
             continue
-        em = new_emitter(body.firm_id, sol["id"])
+        em = new_emitter(firm_id, sol["id"])
         results.append({"solicitation_id": sol["id"], "title": sol["title"], "score": item.get("score"),
-                        **execute_run(em, body.firm_id, sol["id"], False, llm)})
-    return {"firm_id": body.firm_id, "runs": results}
+                        **execute_run(em, firm_id, sol["id"], False, llm)})
+    return results
+
+
+def _fallback_runs(firm_id: int, llm: MetaClient) -> list[dict]:
+    results = []
+    for sol in _fallback_solicitations():
+        em = new_emitter(firm_id, sol["id"])
+        results.append({"solicitation_id": sol["id"], "title": sol["title"], "score": None, **execute_run(em, firm_id, sol["id"], False, llm)})
+    return results
+
+
+@router.post("/agent/run-daily")
+def run_daily(body: DailyIn, x_admin_key: str | None = Header(None), x_api_key: str | None = Header(None), llm: MetaClient = Depends(get_llm)):
+    """Pull the shortlist, ingest the top 3 by score, run the chain on each, store results. Never sends email.
+
+    Authenticated by X-Admin-Key (X-API-Key is still accepted). If the shortlist is unreachable or errors, the run
+    falls back to the demo solicitations plus recent ingests and logs a shortlist_fallback event instead of failing.
+    """
+    key = get_settings().copilot_admin_key
+    sent = x_admin_key or x_api_key
+    if not key or not sent or not hmac.compare_digest(sent.encode(), key.encode()):
+        raise HTTPException(401, "invalid or missing X-Admin-Key")
+    if not firms.get_firm(body.firm_id):
+        raise HTTPException(404, f"firm {body.firm_id} not found")
+    try:
+        items = _shortlist_items(fetch_shortlist(str(body.firm_id)))
+    except Exception as exc:  # any shortlist fault, including a malformed body, must not fail the daily run
+        reason = (exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}")[:REASON_CHARS]
+        log.warning("shortlist_fallback firm=%s reason=%s", body.firm_id, reason)
+        em = Emitter(lambda ev: _persist(em, body.firm_id, "daily"))
+        em("shortlist_fallback", firm_id=body.firm_id, reason=reason)
+        return {"firm_id": body.firm_id, "fallback": reason, "runs": _fallback_runs(body.firm_id, llm)}
+    items.sort(key=lambda i: i.get("score") or 0, reverse=True)
+    return {"firm_id": body.firm_id, "runs": _daily_runs(body.firm_id, items, llm)}

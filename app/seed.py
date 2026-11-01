@@ -105,7 +105,7 @@ def seed_demo_solicitation() -> None:
             f"INSERT OR IGNORE INTO solicitations ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
             tuple(row.values()),
         )
-        conn.execute("UPDATE solicitations SET due_date = ? WHERE id = ?", (due, DEMO_SOLICITATION_ID))
+        conn.execute("UPDATE solicitations SET due_date = ? WHERE id = ? AND due_date IS NOT ?", (due, DEMO_SOLICITATION_ID, due))
 
 
 def load_private_entries() -> list[dict] | None:

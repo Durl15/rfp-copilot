@@ -26,6 +26,7 @@ class Settings:
     db_path: Path
     copilot_admin_key: str
     max_run_input_tokens: int
+    max_daily_runs: int
     price_in_per_mtok: float
     price_out_per_mtok: float
 
@@ -41,6 +42,7 @@ def get_settings() -> Settings:
         db_path=Path(_env("DB_PATH") or ROOT / "data" / "rfp_copilot.sqlite3"),
         copilot_admin_key=_env("COPILOT_ADMIN_KEY"),
         max_run_input_tokens=int(_env("MAX_RUN_INPUT_TOKENS") or 60000),
+        max_daily_runs=int(_env("MAX_DAILY_RUNS") or 150),
         price_in_per_mtok=float(_env("PRICE_IN_PER_MTOK") or 0.50),
         price_out_per_mtok=float(_env("PRICE_OUT_PER_MTOK") or 2.00),
     )

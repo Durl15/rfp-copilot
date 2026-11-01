@@ -53,7 +53,10 @@ Port 8003 avoids the usual 8000–8002 collisions on the dev machine. Migrations
 | `CIVICPROCUREBOT_API_KEY` | – | Sent as `X-API-Key` (assumed header; see `app/shortlist.py`) |
 | `SAM_API_KEY` | – | Only for `sam_notice_id` ingestion |
 | `DB_PATH` | `data/rfp_copilot.sqlite3` | SQLite file (local dev) |
-| `COPILOT_ADMIN_KEY` | – | Required `X-API-Key` for `POST /agent/run-daily` and `X-Admin-Key` for `POST /solicitations/{id}/demo-label`; blank means the endpoint rejects everything |
+| `COPILOT_ADMIN_KEY` | – | Required `X-Admin-Key` for `POST /agent/run-daily`, `POST /solicitations/{id}/demo-label` and the past-performance remove route; also bypasses per-IP abuse limits. Blank means those endpoints reject everything |
+| `GCS_BUCKET` | – | GCS bucket for database persistence. Unset = no storage sync (local dev, tests) |
+| `MAX_DAILY_RUNS` | `150` | Global cap on agent runs per rolling 24 hours (429 beyond it) |
+| `LOG_LEVEL` | `INFO` | Python log level |
 | `MAX_RUN_INPUT_TOKENS` | `60000` | Token guard: a run whose first-call input exceeds this stops with `step_failed` |
 | `PRICE_IN_PER_MTOK` / `PRICE_OUT_PER_MTOK` | `0.50` / `2.00` | USD per million tokens for `est_cost_usd`. Assumed rates: set Meta's actual pricing |
 
@@ -69,9 +72,9 @@ Do not wrap values in quotes in Railway or `.env`.
   Returns the tagged record (`due_date`, `naics`, `set_aside`, `participation_goals`, `place_of_performance`, `section_c/l/m`, `file_id`, and `llm_filled`, the list of fields the model had to fill because regex missed them).
 - `GET /solicitations/{id}`
 - `GET /shortlist/today?firm_id=` — CivicProcureBot proxy
-- `POST /agent/run` `{firm_id, solicitation_id, override_no_bid: false}` — Server-Sent Events: go/no-go, then matrix, narrative, capability statement. A `no_bid` verdict stops after go/no-go (reasons in `decision` and `run_complete`) unless `override_no_bid` is true. Events: `run_started`, `step_started`, `tool_call`, `tool_result`, `decision`, `matrix_row`, `narrative`, `capability_statement`, `step_failed`, `run_complete`; each carries `seq` and `timestamp`. The token guard counts input tokens first and stops with `step_failed` above `MAX_RUN_INPUT_TOKENS`.
+- `POST /agent/run` `{firm_id, solicitation_id, override_no_bid: false}` — Server-Sent Events: go/no-go, then matrix, narrative, capability statement. A `no_bid` verdict stops after go/no-go (reasons in `decision` and `run_complete`) unless `override_no_bid` is true. A `needs_review` verdict runs the compliance matrix only (no narrative or capability statement) and `run_complete.export_url` points at `kind=matrix`; `bid` runs the full chain. The stream sends an SSE `: keepalive` comment every 15 seconds of silence. Events: `run_started`, `step_started`, `tool_call`, `tool_result`, `decision`, `matrix_row`, `narrative`, `capability_statement`, `step_failed`, `run_complete`; each carries `seq` and `timestamp`. The token guard counts input tokens first and stops with `step_failed` above `MAX_RUN_INPUT_TOKENS`.
 - `GET /runs/{run_id}` — the stored event log of a run, for replay with no model spend. Every `llm_calls` row carries its `run_id`; estimated cost is logged per run.
-- `POST /agent/run-daily` `{firm_id}` with header `X-API-Key` — pulls the CivicProcureBot shortlist, ingests the top 3 by score, runs the full chain on each, and returns a summary list. It never sends email.
+- `POST /agent/run-daily` `{firm_id}` with header `X-Admin-Key` (`X-API-Key` is still accepted) — pulls the CivicProcureBot shortlist, ingests the top 3 by score, runs the chain on each, and returns a summary list. If the shortlist is unreachable or errors, it falls back to every `demo=true` solicitation plus any ingested in the last 14 days, records a `shortlist_fallback` event (reason included, stored with `solicitation_id` `daily`), and returns the reason under `fallback`. It never fails because the shortlist is down and never sends email.
 - `GET /demo/solicitations`
 - `POST /solicitations/{id}/demo-label` `{demo, title?, due_date?, set_aside?, participation_goals?}` with header `X-Admin-Key` (= `COPILOT_ADMIN_KEY`) — sets `demo` and the given fields; an omitted field is untouched, a field sent as `null` is cleared.
 - `GET /health`
@@ -99,6 +102,48 @@ Muse Voice Transcribe contract (`POST {META_API_BASE}/asr/transcribe`, bearer `M
 Conversion uses ffmpeg from the `imageio-ffmpeg` package (no system ffmpeg). The `imageio-ffmpeg` 0.7.0 `manylinux2014_x86_64` wheel bundles a linux x86_64 ffmpeg binary, so the Railway image needs no change.
 
 Smoke test (one real call): `python scripts/voice_smoke.py <audio> [firm_id] [--hints "a, b"]`.
+
+## Deploy (Google Cloud Run)
+
+Project `dj-ai-grant-consultant`, region `us-east1`, service `rfp-copilot`. **The Cloud Run service URL is the live product link for the hackathon submission.** Run from the repo root in PowerShell, with `gcloud` authenticated and `MODEL_API_KEY` and `COPILOT_ADMIN_KEY` set in `.env`:
+
+```powershell
+.\scripts\seed_prod.ps1       # once, before the first deploy: uploads datafp_copilot.sqlite3 to gs://rfp-copilot-data (refuses if it already exists; -Force overrides)
+.\scripts\deploy.ps1          # idempotent: APIs, bucket, service account, secrets, Cloud Build + deploy, then GET /health and /solicitations
+.\scripts\schedule_daily.ps1  # creates or updates Cloud Scheduler job rfp-copilot-daily: 07:30 America/New_York, POST /agent/run-daily
+```
+
+`seed_prod.ps1` makes production start with the DASNY 7628 solicitation and the confirmed Woodfork entry from your local database. Secret values are read from `.env` (deploy) or Secret Manager (schedule) and never printed.
+
+| Variable | Cloud Run value | Source |
+|---|---|---|
+| `MODEL_API_KEY` | – | Secret Manager `MODEL_API_KEY` |
+| `COPILOT_ADMIN_KEY` | – | Secret Manager `COPILOT_ADMIN_KEY` |
+| `META_API_BASE` | `https://api.meta.ai/v1` | env var |
+| `META_MODEL` | `muse-spark-1.3` | env var |
+| `DB_PATH` | `/tmp/rfp_copilot.sqlite3` | env var |
+| `GCS_BUCKET` | `rfp-copilot-data` | env var |
+| `LOG_LEVEL` | `INFO` | env var |
+| `MAX_DAILY_RUNS` | `150` | env var |
+
+`CIVICPROCUREBOT_API_BASE`, `CIVICPROCUREBOT_API_KEY` and `SAM_API_KEY` are not set by `deploy.ps1`; until they are, the daily run uses its shortlist fallback.
+
+### Persistence model
+
+SQLite runs on the container's ephemeral disk at `DB_PATH` and is mirrored to `gs://$GCS_BUCKET/rfp_copilot.sqlite3` as a whole file (`app/storage.py`):
+
+- On startup, if the bucket has the file it is downloaded **before** migrations and seeding. A storage error at that point aborts startup, so an empty database can never overwrite the real one.
+- After any committed write (ingest, decision, confirm, reject, remove, run events), an upload is scheduled 5 seconds out; writes in that window share the one upload. The upload is a consistent snapshot (sqlite backup API, WAL-safe). Shutdown uploads once more. Each sync is logged at INFO with its byte size.
+- Seeding only inserts missing firms and the demo solicitation; restarts never duplicate rows.
+- **Single-instance constraint:** whole-file sync has no merge, so two instances would overwrite each other. The service is deployed with `--min-instances 1 --max-instances 1` (one writer, no cold start during the demo) and `--no-cpu-throttling` so the debounced upload and in-flight runs get CPU outside a request. Writes in the last 5 seconds before a crash can be lost.
+
+### Abuse limits
+
+The URL is public, so (in memory, per process, which is correct only with one instance):
+
+- Per IP: 6 agent runs per hour across `POST /agent/run`, `/agent/go-no-go` and `/agent/matrix`, and 10 uploads per hour on `POST /voice/past-performance`. Requests with a valid `X-Admin-Key` bypass the per-IP limits. The IP is the last `X-Forwarded-For` entry (the address Cloud Run appends).
+- Global: `MAX_DAILY_RUNS` (default 150) agent runs per rolling 24 hours, admin included. `POST /agent/run-daily` is not counted.
+- Both return `429` with a plain message. Voice uploads over 25 MB return `413`.
 
 ## Console
 
@@ -131,7 +176,7 @@ Drop sample solicitations in `tests/fixtures/*.pdf` to enable the real-PDF tagge
 
 ## Known limits
 
-- SQLite lives on local disk. Fine for the hackathon demo; on Railway the filesystem is ephemeral, so move to Postgres before real data lands there.
+- SQLite with whole-file GCS sync, single instance only (see Deploy). Move to Postgres before real multi-user data lands.
 - Token counting uses the Responses API `input_tokens` endpoint (`MetaClient.count_input_tokens`); it is not verified against Meta's live API. If it fails, the run stops at the token guard rather than spending unchecked.
 - Scanned (image-only) PDFs are rejected: no OCR yet.
 - Only Sections C, L, and M are captured.

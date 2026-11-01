@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from app import db, firms
+from app import db, firms, limits
 from app.agent.events import Emitter
 from app.agent.run import _persist
 from app.config import get_settings
@@ -190,7 +190,7 @@ def _emitter(firm_id: int, run_id: str | None = None) -> Emitter:
     return em
 
 
-@router.post("/voice/past-performance")
+@router.post("/voice/past-performance", dependencies=[Depends(limits.voice_upload_limit)])
 async def voice_past_performance(audio: UploadFile = File(...), firm_id: int = Form(...), hints: str | None = Form(None), llm: MetaClient = Depends(get_llm)):
     if not firms.get_firm(firm_id):
         raise HTTPException(404, f"firm {firm_id} not found")

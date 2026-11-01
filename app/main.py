@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from app import console, demo, export, firms, routes, shortlist, voice
+from app import console, demo, export, firms, routes, shortlist, storage, voice
 from app.agent import capability, go_no_go, matrix, narrative, run
 from app.config import get_settings
 from app.db import init_db
@@ -12,9 +12,11 @@ from app.seed import seed_firms
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    storage.download_if_present()  # before migrations, so the restored file is the one that gets migrated and seeded
     init_db()
     seed_firms()
     yield
+    storage.flush()
 
 
 app = FastAPI(title="RFP Copilot", lifespan=lifespan)

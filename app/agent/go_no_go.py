@@ -6,7 +6,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from app import claims, firms, ingest
+from app import claims, firms, ingest, limits
 from app.agent import tools
 from app.agent.events import noop
 from app.agent.matrix import PP_NONE_MIN as PP_CLEAR_MIN
@@ -220,7 +220,7 @@ class GoNoGoIn(BaseModel):
     solicitation_id: str
 
 
-@router.post("/agent/go-no-go")
+@router.post("/agent/go-no-go", dependencies=[Depends(limits.agent_run_limit)])
 def go_no_go(body: GoNoGoIn, llm: MetaClient = Depends(get_llm)):
     if not firms.get_firm(body.firm_id):
         raise HTTPException(404, f"firm {body.firm_id} not found")
