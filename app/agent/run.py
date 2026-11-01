@@ -176,6 +176,14 @@ def read_run(run_id: str):
         raise HTTPException(404, "run not found")
     out = dict(r)
     out["events"] = json.loads(out["events"])
+    with db.session() as conn:
+        u = conn.execute(
+            "SELECT COALESCE(SUM(prompt_tokens), 0) AS tokens_in, COALESCE(SUM(completion_tokens), 0) AS tokens_out,"
+            " COALESCE(SUM(cached_tokens), 0) AS cached_tokens, COALESCE(SUM(latency_ms), 0) AS model_latency_ms"
+            " FROM llm_calls WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    out["usage"] = dict(u)
     return out
 
 

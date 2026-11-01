@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFP Copilot - Agent Console</title>
+<link rel="stylesheet" href="/static/console.css">
+</head>
+<body>
+<header class="top">
+  <svg class="mark" viewBox="0 0 40 40" role="img" aria-label="Phoenix mark">
+    <path d="M20 4 L24 16 L20 36 L16 16 Z" fill="#C8451B"/>
+    <path d="M18 17 L2 6 L8 22 L16 27 Z" fill="#1B1A18"/>
+    <path d="M22 17 L38 6 L32 22 L24 27 Z" fill="#1B1A18"/>
+    <path d="M20 36 L12 38 L20 31 L28 38 Z" fill="#C8451B"/>
+  </svg>
+  <div>
+    <div class="wordmark">RFP Copilot</div>
+    <div class="byline">DJ AI Business Consultant LLC</div>
+  </div>
+</header>
+
+<main class="cols">
+  <aside class="col left">
+    <section>
+      <h2>Firm</h2>
+      <select id="firm-select" aria-label="Firm"></select>
+      <div id="firm-card" class="card"></div>
+      <h3>Past performance</h3>
+      <ul id="pp-list" class="pp"></ul>
+      <div id="firm-error" class="err" hidden></div>
+    </section>
+    <section>
+      <h2>Solicitation</h2>
+      <ul id="sol-list" class="sols"></ul>
+      <div id="sol-error" class="err" hidden></div>
+    </section>
+  </aside>
+
+  <section class="col center">
+    <div class="actions">
+      <button id="run-btn" class="primary" type="button">Run agent</button>
+      <button id="replay-btn" type="button">Replay last run</button>
+      <span id="run-status" class="muted"></span>
+    </div>
+    <div id="run-error" class="err" hidden></div>
+    <div id="verdict"></div>
+    <ol id="trace" class="trace"></ol>
+    <div id="results" hidden>
+      <div class="tabs" role="tablist">
+        <button type="button" data-tab="matrix" class="on">Matrix</button>
+        <button type="button" data-tab="narrative">Narrative</button>
+        <button type="button" data-tab="capability">Capability Statement</button>
+        <span class="spacer"></span>
+        <a id="dl-capability" class="btn" href="#">Capability .docx</a>
+        <a id="dl-matrix" class="btn" href="#">Matrix .docx</a>
+        <a id="dl-bidpacket" class="btn" href="#">Bid packet .docx</a>
+      </div>
+      <div id="tab-matrix" class="pane"></div>
+      <div id="tab-narrative" class="pane" hidden></div>
+      <div id="tab-capability" class="pane" hidden></div>
+    </div>
+    <div id="run-footer" class="runfoot"></div>
+  </section>
+
+  <aside class="col right">
+    <section>
+      <h2>Voice intake</h2>
+      <p class="muted small">Record or upload a voice note about past work. Nothing is saved until you confirm.</p>
+      <div class="row">
+        <button id="upload-btn" type="button">Upload</button>
+        <button id="record-btn" type="button">Record</button>
+        <input id="audio-file" type="file" accept="audio/*" hidden>
+      </div>
+      <div id="audio-name" class="muted small"></div>
+      <audio id="audio-preview" controls hidden></audio>
+      <input id="hints" type="text" placeholder="names the transcript may misspell, comma-separated">
+      <button id="voice-submit" class="primary" type="button" disabled>Transcribe and extract</button>
+      <div id="voice-progress" class="progress" hidden></div>
+      <div id="voice-error" class="err" hidden></div>
+      <div id="voice-result" hidden>
+        <h3>Transcript</h3>
+        <p id="voice-transcript" class="transcript"></p>
+        <h3>Extracted entry</h3>
+        <div id="voice-fields"></div>
+        <div class="row">
+          <button id="voice-confirm" class="primary" type="button">Confirm</button>
+          <button id="voice-reject" type="button">Reject</button>
+        </div>
+      </div>
+      <div id="voice-done" class="ok" hidden></div>
+    </section>
+  </aside>
+</main>
+
+<footer class="foot"><span id="health">checking /health...</span></footer>
+<script src="/static/console.js"></script>
+</body>
+</html>

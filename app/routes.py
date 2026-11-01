@@ -70,6 +70,17 @@ async def create_solicitation(request: Request):
     return _public(row)
 
 
+@router.get("/solicitations")
+def list_solicitations():
+    """Every solicitation, demo and ingested, newest first."""
+    with db.session() as conn:
+        rows = conn.execute(
+            "SELECT id, title, naics, set_aside, participation_goals, due_date, demo, created_at"
+            " FROM solicitations ORDER BY created_at DESC, id"
+        ).fetchall()
+    return [{**dict(r), "demo": bool(r["demo"])} for r in rows]
+
+
 @router.get("/solicitations/{sol_id}")
 def read_solicitation(sol_id: str):
     row = ingest.get_solicitation(sol_id)

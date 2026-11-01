@@ -100,6 +100,21 @@ Conversion uses ffmpeg from the `imageio-ffmpeg` package (no system ffmpeg). The
 
 Smoke test (one real call): `python scripts/voice_smoke.py <audio> [firm_id] [--hints "a, b"]`.
 
+## Console
+
+Open the agent console at `GET /` (a static page, no build step: `app/static/index.html`, `console.js`, `console.css`). Left: firm, past performance (VERIFIED/UNVERIFIED), solicitation picker. Center: **Run agent** streams `POST /agent/run` as a live trace, then the verdict card, Matrix / Narrative / Capability tabs and .docx downloads. **Replay last run** plays the stored events at 8x. Right: voice intake (upload or record, confirm or reject).
+
+![Agent console](docs/console.png)
+
+`GET /solicitations` lists demo and ingested solicitations newest first. `DELETE /firms/{firm_id}/past-performance/{entry_index}` (header `X-Admin-Key` = `COPILOT_ADMIN_KEY`) removes an entry and records a `past_performance_removed` event; the console's Remove button asks for the key once per browser session.
+
+Demo reset sequence between takes:
+
+1. Remove the Woodfork entry (Remove button on its VERIFIED row).
+2. Run the agent: `no_bid` by rule (zero verified matches).
+3. Record the voice note, review the fields, **Confirm**: the entry appears as VERIFIED.
+4. Run the agent again: `needs_review`.
+
 ## Demo data
 
 **Demo firms and demo solicitations are fictional.** Firms 2 and 3 (`demo=true`) and the seeded county facilities electrical maintenance solicitation (NAICS 238210, HUBZone set-aside, Syracuse) are invented for demonstration; none of their clients, contracts, values or references are real. Firm 2 carries three `verified=true` past-performance entries that match the demo solicitation, so a run on it reaches a `bid` or `needs_review` verdict. Firm 1 is the only real firm.
