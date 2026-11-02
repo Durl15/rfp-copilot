@@ -21,21 +21,34 @@ def _run(matches, payload=None, firm_id=2):
 def test_zero_matches_force_no_bid_and_cap_even_if_model_says_bid():
     d = _run([])["decision"]
     assert (d["verdict"], d["score"], d["verdict_source"]) == ("no_bid", 35, "rule")
-    assert "No verified past performance" in d["rule_reason"] and d["top_reasons"][0] == d["rule_reason"]
+    assert "No verified past performance" in d["rule_reason"] and d["top_reasons"] == FINAL["top_reasons"][:3]
     (saved,) = rows("SELECT verdict, score, verdict_source, rule_reason FROM decisions")
     assert saved == {"verdict": "no_bid", "score": 35, "verdict_source": "rule", "rule_reason": d["rule_reason"]}
 
 
+ONE_OR_TWO_REASON = "one or two verified scope matches: review required, bid not yet supported"
+
+
 @pytest.mark.parametrize("n", [1, 2])
-def test_one_or_two_validated_matches_cap_at_needs_review(n):
-    d = _run(claimed(n))["decision"]
-    assert (d["verdict"], d["score"], d["verdict_source"]) == ("needs_review", 65, "rule")
-    assert d["rule_reason"] and len(d["verified_matches"]) == n and d["rejected_matches"] == []
+@pytest.mark.parametrize("verdict, score", [("bid", 82), ("no_bid", 28), ("no_bid", 20), ("bid", 50)])
+def test_one_or_two_matches_override_to_needs_review_in_range(n, verdict, score):
+    d = _run(claimed(n), {"verdict": verdict, "score": score})["decision"]
+    assert (d["verdict"], d["verdict_source"], d["rule_reason"]) == ("needs_review", "rule", ONE_OR_TWO_REASON)
+    assert d["score"] == min(max(score, 40), 65) and len(d["verified_matches"]) == n and d["rejected_matches"] == []
+    assert d["top_reasons"] == FINAL["top_reasons"][:3] and d["rationale_for_verdict"] == FINAL["rationale_for_verdict"]
 
 
-def test_one_match_does_not_raise_a_no_bid():
-    d = _run(claimed(1), {"verdict": "no_bid", "score": 20})["decision"]
-    assert (d["verdict"], d["score"], d["verdict_source"], d["rule_reason"]) == ("no_bid", 20, "model", "")
+@pytest.mark.parametrize("score, expected", [(55, 55), (40, 40), (65, 65), (30, 40), (90, 65)])
+def test_needs_review_from_model_stays_model_and_score_is_clamped(score, expected):
+    d = _run(claimed(1), {"verdict": "needs_review", "score": score})["decision"]
+    assert (d["verdict"], d["score"]) == ("needs_review", expected)
+    assert d["verdict_source"] == "model"
+    assert (d["rule_reason"] == "") == (score == expected)
+
+
+def test_zero_matches_cap_applies_to_a_low_no_bid_too():
+    d = _run([], {"verdict": "no_bid", "score": 20})["decision"]
+    assert (d["verdict"], d["score"], d["verdict_source"]) == ("no_bid", 20, "rule")
 
 
 def test_three_validated_matches_leave_model_verdict_and_are_stored():
@@ -64,8 +77,9 @@ def test_out_of_range_and_duplicate_indexes_are_rejected():
 
 
 def test_hard_blocker_forces_no_bid_even_with_three_matches():
-    d = _run(claimed(3), {"blockers": ["SDVOSB set-aside, firm not certified"]})["decision"]
-    assert (d["verdict"], d["verdict_source"]) == ("no_bid", "rule") and "SDVOSB" in d["rule_reason"]
+    d = _run(claimed(3), {"blockers": ["SDVOSB set-aside, firm not certified"], "score": 90})["decision"]
+    assert (d["verdict"], d["score"], d["verdict_source"]) == ("no_bid", 35, "rule") and "SDVOSB" in d["rule_reason"]
+    assert d["top_reasons"] == FINAL["top_reasons"][:3]
 
 
 def test_profile_and_search_expose_entry_index():
@@ -79,6 +93,11 @@ def test_profile_and_search_expose_entry_index():
 def test_schema_requires_verified_matches():
     assert "verified_matches" in go_no_go.GO_NO_GO_SCHEMA["required"]
     assert "entry_index" in go_no_go.SYSTEM_PROMPT
+
+
+def test_schema_and_prompt_ask_for_every_overlapping_verified_entry():
+    assert "EVERY firm entry marked verified" in go_no_go.SYSTEM_PROMPT
+    assert "EVERY verified firm entry" in go_no_go.GO_NO_GO_SCHEMA["properties"]["verified_matches"]["description"]
 
 
 def test_prompt_states_the_floor_rule():

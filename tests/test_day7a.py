@@ -98,3 +98,90 @@ def test_sse_headers_and_run_usage():
     run_id = json.loads(r.text.split("data: ", 1)[1].split("\n", 1)[0])["run_id"]
     usage = TestClient(app).get(f"/runs/{run_id}").json()["usage"]
     assert set(usage) == {"tokens_in", "tokens_out", "cached_tokens", "model_latency_ms"}
+
+
+# ---------- Day 8: solicitation cleanup ----------
+
+def _sol(sol_id, title, source="text", created="2026-01-01T00:00:00+00:00"):
+    conn = db.connect()
+    conn.execute("INSERT INTO solicitations (id, created_at, source, raw_text, title, demo) VALUES (?, ?, ?, 'x', ?, 0)",
+                 (sol_id, created, source, title))
+    conn.execute("INSERT INTO decisions (created_at, solicitation_id, firm_id, verdict, score) VALUES (?, ?, 1, 'no_bid', 10)", (created, sol_id))
+    conn.execute("INSERT INTO matrix_rows (created_at, solicitation_id, firm_id, position, requirement, section_ref, firm_capability,"
+                 " gap, evidence_needed, draft_response) VALUES (?, ?, 1, 0, 'r', 'C', 'c', 'none', 'e', 'd')", (created, sol_id))
+    conn.execute("INSERT INTO artifacts (solicitation_id, firm_id, kind, created_at, content) VALUES (?, 1, 'narrative', ?, 'n')", (sol_id, created))
+    conn.execute("INSERT INTO runs (run_id, created_at, firm_id, solicitation_id, status) VALUES (?, ?, 1, ?, 'done')", ("run-" + sol_id, created, sol_id))
+    conn.commit()
+    conn.close()
+
+
+def _count(table, sol_id):
+    return rows(f"SELECT COUNT(*) AS n FROM {table} WHERE solicitation_id = ?", (sol_id,))[0]["n"]
+
+
+KEY = {"X-Admin-Key": "s3cret"}
+
+
+def test_delete_solicitation_requires_admin_key(monkeypatch):
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "s3cret")
+    c = _client()
+    _sol("a", "A")
+    for headers in ({}, {"X-Admin-Key": "wrong"}):
+        assert c.delete("/solicitations/a", headers=headers).status_code == 401
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "")
+    assert c.delete("/solicitations/a", headers=KEY).status_code == 401
+    assert _count("decisions", "a") == 1
+
+
+def test_delete_solicitation_cascades_and_returns_counts(monkeypatch):
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "s3cret")
+    c = _client()
+    _sol("a", "A")
+    _sol("b", "B")
+    r = c.delete("/solicitations/a", headers=KEY)
+    assert r.status_code == 200
+    assert r.json() == {"id": "a", "deleted": {"solicitations": 1, "decisions": 1, "matrix_rows": 1, "artifacts": 1, "runs": 1}}
+    assert all(_count(t, "a") == 0 for t in ("decisions", "matrix_rows", "artifacts", "runs"))
+    assert rows("SELECT id FROM solicitations WHERE id = 'a'") == []
+    assert all(_count(t, "b") == 1 for t in ("decisions", "matrix_rows", "artifacts", "runs"))
+    assert c.delete("/solicitations/a", headers=KEY).status_code == 404
+
+
+def test_dedupe_requires_admin_key(monkeypatch):
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "s3cret")
+    c = _client()
+    _sol("a", "")
+    for headers in ({}, {"X-Admin-Key": "wrong"}):
+        assert c.post("/solicitations/dedupe", headers=headers).status_code == 401
+    assert _count("decisions", "a") == 1
+
+
+def test_dedupe_dry_run_reports_plan_without_deleting(monkeypatch):
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "s3cret")
+    c = _client()
+    _sol("old", "Same", created="2026-01-01T00:00:00+00:00")
+    _sol("new", "Same", created="2026-02-01T00:00:00+00:00")
+    _sol("blank", "  ")
+    r = c.post("/solicitations/dedupe?dry_run=true", headers=KEY).json()
+    assert r["dry_run"] is True and r["deleted"] is None
+    assert {p["id"]: p["reason"] for p in r["removed"]} == {"old": "older duplicate of the same title and source", "blank": "empty title"}
+    assert len(rows("SELECT id FROM solicitations WHERE demo = 0")) == 3 and _count("runs", "old") == 1
+
+
+def test_dedupe_removes_empty_and_older_duplicates_with_cascade(monkeypatch):
+    monkeypatch.setenv("COPILOT_ADMIN_KEY", "s3cret")
+    c = _client()
+    _sol("old", "Same", created="2026-01-01T00:00:00+00:00")
+    _sol("new", "Same", created="2026-02-01T00:00:00+00:00")
+    _sol("other-source", "Same", source="pdf", created="2026-01-01T00:00:00+00:00")
+    _sol("blank", "")
+    conn = db.connect()
+    conn.execute("UPDATE solicitations SET title = NULL WHERE id = 'blank'")
+    conn.commit()
+    conn.close()
+    r = c.post("/solicitations/dedupe", headers=KEY).json()
+    assert sorted(p["id"] for p in r["removed"]) == ["blank", "old"]
+    assert r["deleted"] == {"solicitations": 2, "decisions": 2, "matrix_rows": 2, "artifacts": 2, "runs": 2}
+    left = {x["id"] for x in rows("SELECT id FROM solicitations WHERE demo = 0")}
+    assert left == {"new", "other-source"}
+    assert _count("decisions", "old") == 0 and _count("decisions", "new") == 1

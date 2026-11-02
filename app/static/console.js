@@ -86,13 +86,17 @@
     }));
     $("replay-btn").disabled = !store("get", lastRunKey(f.id));
   }
-  async function removeEntry(index) {
+  function adminKey() {
     let key = session("get", "rfp.adminKey");
     if (!key) {
       key = (window.prompt("Admin key (kept for this browser session):") || "").trim();
-      if (!key) return;
-      session("set", "rfp.adminKey", key);
+      if (key) session("set", "rfp.adminKey", key);
     }
+    return key;
+  }
+  async function removeEntry(index) {
+    const key = adminKey();
+    if (!key) return;
     try {
       await api(`/firms/${state.firmId}/past-performance/${index}`, { method: "DELETE", headers: { "X-Admin-Key": key } });
       showErr("firm-error", "");
@@ -112,9 +116,20 @@
     if (!sol()) state.solId = state.sols.length ? state.sols[0].id : null;
     renderSols();
   }
+  async function removeSol(id) {
+    const key = adminKey();
+    if (!key) return;
+    try {
+      await api(`/solicitations/${encodeURIComponent(id)}`, { method: "DELETE", headers: { "X-Admin-Key": key } });
+      await loadSols();
+    } catch (e) {
+      if (e.status === 401) { session("del", "rfp.adminKey"); showErr("sol-error", "admin key rejected"); }
+      else showErr("sol-error", `Remove failed. ${e.message}`);
+    }
+  }
   function renderSols() {
     $("sol-list").replaceChildren(...state.sols.map((s) => h("li", { class: s.id === state.solId ? "sel" : "", onclick: () => { state.solId = s.id; renderSols(); } },
-      h("div", { class: "t" }, s.title || s.id, " ", s.demo ? h("span", { class: "badge" }, "DEMO") : null),
+      h("div", { class: "t" }, s.title || s.id, " ", s.demo ? h("span", { class: "badge" }, "DEMO") : h("button", { class: "tiny", type: "button", onclick: (ev) => { ev.stopPropagation(); removeSol(s.id); } }, "Remove")),
       h("div", { class: "m" }, [s.naics && `NAICS ${s.naics}`, s.set_aside, s.due_date && `due ${s.due_date}`].filter(Boolean).join(" · ")),
       s.participation_goals ? h("div", { class: "m" }, `Goals: ${s.participation_goals}`) : null)));
   }

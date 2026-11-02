@@ -94,7 +94,8 @@ def test_no_bid_stops_after_go_no_go_and_emits_reasons(monkeypatch):
     assert "matrix" not in [e.get("step") for e in events]
     done = events[-1]
     assert (done["verdict"], done["export_url"], done["readiness_pct"]) == ("no_bid", None, None)
-    assert done["reasons"] == events[-2]["payload"]["top_reasons"] and "No verified past performance" in done["reasons"][0]
+    assert done["reasons"] == events[-2]["payload"]["top_reasons"]
+    assert "No verified past performance" in events[-2]["payload"]["rule_reason"]
     assert len(sdk.calls) == 1
 
 

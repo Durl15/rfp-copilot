@@ -81,6 +81,60 @@ def list_solicitations():
     return [{**dict(r), "demo": bool(r["demo"])} for r in rows]
 
 
+SOL_CHILD_TABLES = ("decisions", "matrix_rows", "artifacts", "runs")
+
+
+def _require_admin(x_admin_key: str | None) -> None:
+    key = get_settings().copilot_admin_key
+    if not key or not x_admin_key or not hmac.compare_digest(x_admin_key.encode(), key.encode()):
+        raise HTTPException(401, "invalid or missing X-Admin-Key")
+
+
+def _delete_solicitations(conn, ids: list[str]) -> dict:
+    """Delete the solicitations and every dependent row; returns per-table counts."""
+    counts = dict.fromkeys(("solicitations", *SOL_CHILD_TABLES), 0)
+    for sol_id in ids:
+        for table in SOL_CHILD_TABLES:
+            counts[table] += conn.execute(f"DELETE FROM {table} WHERE solicitation_id = ?", (sol_id,)).rowcount
+        counts["solicitations"] += conn.execute("DELETE FROM solicitations WHERE id = ?", (sol_id,)).rowcount
+    return counts
+
+
+@router.post("/solicitations/dedupe")
+def dedupe_solicitations(dry_run: bool = False, x_admin_key: str | None = Header(None)):
+    """Remove solicitations with an empty title, and all but the newest of each (title, source) group."""
+    _require_admin(x_admin_key)
+    with db.session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        found = conn.execute(
+            "SELECT id, title, source, created_at FROM solicitations ORDER BY created_at DESC, rowid DESC"
+        ).fetchall()
+        seen, plan = set(), []
+        for r in found:
+            title = (r["title"] or "").strip()
+            if not title:
+                reason = "empty title"
+            elif (title, r["source"]) in seen:
+                reason = "older duplicate of the same title and source"
+            else:
+                seen.add((title, r["source"]))
+                continue
+            plan.append({"id": r["id"], "title": r["title"], "source": r["source"], "created_at": r["created_at"], "reason": reason})
+        counts = None if dry_run else _delete_solicitations(conn, [p["id"] for p in plan])
+    return {"dry_run": dry_run, "removed": plan, "deleted": counts}
+
+
+@router.delete("/solicitations/{sol_id}")
+def delete_solicitation(sol_id: str, x_admin_key: str | None = Header(None)):
+    _require_admin(x_admin_key)
+    with db.session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        counts = _delete_solicitations(conn, [sol_id])
+    if not counts["solicitations"]:
+        raise HTTPException(404, "not found")
+    return {"id": sol_id, "deleted": counts}
+
+
 @router.get("/solicitations/{sol_id}")
 def read_solicitation(sol_id: str):
     row = ingest.get_solicitation(sol_id)

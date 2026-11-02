@@ -2,181 +2,185 @@
 
 FastAPI service that ingests government solicitations (pasted text, PDF, or SAM.gov notice id), tags the sections that matter for a bid/no-bid decision, and pulls a firm's daily opportunity shortlist from CivicProcureBot. LLM work runs on Meta's Muse Spark through the Meta Model API.
 
-## What pre-existed
+![Agent console](docs/console.png)
 
-- **CivicProcureBot shortlist API** — a separate, already-running service (<https://github.com/Durl15/civicprocurebot>). Its shortlist endpoint is **read-only**; RFP Copilot only proxies it (`GET /shortlist/today`) and never writes to it. Nothing in this repo modifies CivicProcureBot.
+## Try it in 3 minutes
 
-## What was built during the hackathon
+Live: <https://rfp-copilot-uiobenkvzq-ue.a.run.app> (opens the agent console).
 
-Everything in this repository, built Oct 26 – Nov 4, 2026:
+1. **Pick the firm** "DJ AI Business Consultant LLC" (left column, firm 1, the one real firm).
+2. **Pick the solicitation** "DASNY 7628" (a real, closed NYS RFP; the due date is shifted and the title says so).
+3. **Run agent.** The trace streams live: the model reads the profile and the solicitation, searches past performance, and a token guard counts input first. Expect a **`no_bid` by rule** if the Woodfork entry is absent (zero verified matches), or **`needs_review`** if it is present (one verified match). The verdict card shows `RULE` or `MODEL` and the rule reason.
+4. **Add the evidence.** Upload or record a voice note in the right column. Muse Voice Transcribe transcribes it, the model extracts one past-performance entry, and every field shows the verbatim quote it came from. Nothing is saved yet.
+5. **Confirm.** The entry appears in the firm's past performance as **VERIFIED**. (Reject discards it.)
+6. **Run agent again.** With one verified, validated match the verdict is `needs_review`, the score is clamped to 40-65, and the compliance matrix is built (no narrative or capability statement yet, because bid is not supported). Download the matrix as .docx; every file ends with "Draft for human review".
 
-| Piece | Location |
-|---|---|
-| Config from env, SQLite schema + versioned migrations | `app/config.py`, `app/db.py` |
-| Meta Model API client: retry (3x, exponential backoff on 429/5xx), per-call logging to `llm_calls`, streaming | `app/llm/meta_client.py` |
-| Solicitation ingestion (text / PDF / SAM notice), section + field tagger, `solicitations` table | `app/ingest.py`, `app/routes.py` |
-| CivicProcureBot shortlist proxy | `app/shortlist.py` |
-| Test suite | `tests/` |
+Use **Replay last run** to replay a stored run at 8x with no model spend. For a `bid` outcome, pick the fictional firm 2 with the fictional electrical solicitation: it has three verified entries, so the model's verdict stands and the narrative and capability statement are generated.
 
-### Meta capabilities used
+Why the verdicts come out the way they do: see [Honesty guards](#honesty-guards).
 
-| Capability | Where | Status |
+## Architecture
+
+```
+ Browser console (static HTML/JS, no build)
+        |  POST /agent/run  (Server-Sent Events back)
+        v
+ FastAPI (app/main.py, Cloud Run, 1 instance)
+        |
+        v
+ Agent loop (app/agent/run.py)
+   token guard -> go/no-go (tool loop) -> floor -> matrix -> narrative -> capability
+        |                     ^
+        |                     |  read-only tools: firm profile, solicitation,
+        |                     |  set-aside/NAICS check, past-performance search
+        v
+ Meta Model API (api.meta.ai/v1)
+   - Muse Spark 1.3, Responses API (tools, json_schema, reasoning, store)
+   - Muse Voice Transcribe (/asr/transcribe, WAV only)
+        |
+        v
+ SQLite on the container disk ---- debounced whole-file sync ----> GCS bucket
+        ^
+        |  POST /agent/run-daily (X-Admin-Key)
+ Cloud Scheduler, 07:30 America/New_York  ---- reads ----> CivicProcureBot shortlist (optional)
+```
+
+### Meta capabilities
+
+Each row was checked against the code.
+
+| Capability | Where | Why it matters |
 |---|---|---|
-| Responses API via the OpenAI SDK (`base_url` = Meta endpoint) | `MetaClient.complete` | Used |
-| Structured output (`text.format` JSON schema) | Tagger gap-fill, `json_schema=` | Used |
-| `reasoning.effort` (minimal / low / medium / high) | Every call; tagger uses `low` | Used |
-| Files API | PDF upload on ingest; `file_id` stored on the solicitation | Used |
-| Streaming | `MetaClient.stream` | Implemented, not yet called by a route |
-| Tool use | `tools=` passthrough on `complete` / `stream` | Implemented, not yet called by a route |
+| Tool calling in the agent loop | `app/agent/go_no_go.py` (`MODEL_TOOLS`, `run_go_no_go`), `app/agent/tools.py` | The model reads the firm and solicitation through read-only tools instead of being handed a prompt blob, and the trace shows each call |
+| Structured outputs validated by pydantic | Go/no-go: `GO_NO_GO_SCHEMA` + `GoNoGo` in `app/agent/go_no_go.py`; matrix: `MATRIX_SCHEMA` in `app/agent/matrix.py`; voice: `EXTRACT_SCHEMA` in `app/voice.py`. Also capability statement and tagger gap-fill | Strict JSON schemas via `text.format`; answers are re-validated in code, so a malformed or out-of-contract answer fails loudly rather than reaching a document |
+| Reasoning effort dial per task | `reasoning_effort=` in `go_no_go.py` (`high`), `matrix.py` (`medium`; `minimal` for sub-calls), `narrative.py` and `voice.py` (`minimal`), `capability.py` and `ingest.py` (`low`) | Spends thinking only where the decision is; the client lowers effort one step when a call hits `max_output_tokens` |
+| Prompt caching on the firm/rubric prefix, `cached_tokens` logged | Prefix built in `app/agent/matrix.py` (`_system_prompt`: fixed rubric + key-sorted firm profile, byte-identical across runs); `cached_tokens` read from usage in `app/llm/meta_client.py`, stored in `llm_calls`, summed in `GET /runs/{id}` | Repeat runs for a firm share a stable prefix. The code does not set a cache flag; it keeps the prefix stable and records what the API reports as cached |
+| Token counting as a guard before each run | `app/agent/run.py` (calls `MetaClient.count_input_tokens`; limit `MAX_RUN_INPUT_TOKENS`) | An oversized solicitation stops with `step_failed` before any generation is paid for |
+| Stored responses with `previous_response_id`, stateless fallback | `app/llm/conversation.py`, `MetaClient._create_response` in `app/llm/meta_client.py` (`store=True`) | Reasoning carries across tool turns; if an id is missing or expired the full item list is resent without it, and an incomplete response id is never reused |
+| SSE streaming of the run | `POST /agent/run` in `app/agent/run.py` (`text/event-stream`, 15 s keepalive) | The console shows each tool call, decision and matrix row as it happens; events are stored for replay even if the client disconnects |
+| Muse Voice Transcribe with the WAV contract | `app/voice.py`, `POST /voice/past-performance` | Turns a spoken engagement into a pending, quote-backed entry. Audio is converted to 16 kHz mono 16-bit PCM WAV and sent as two multipart parts (`request`, `audio`) |
 
-Reasoning and structured output use native Responses API parameters (`reasoning`, `text.format`, `previous_response_id`; see the top of `app/llm/meta_client.py`). The Files API `purpose` is still plain HTTP using the assumed wire format in `app/ingest.py`; confirm it against the Meta Model API reference.
+Also used: the Files API for PDF upload on ingest (`app/ingest.py`).
 
-## Setup
+## Honesty guards
+
+- **Verbatim evidence quotes.** The matrix keeps a quote copied character for character from the firm profile for each match; voice extraction must give a verbatim transcript quote for every field it fills. Quotes that are not in the source are rejected.
+- **Verified flag and claim-word validator.** Only `verified=true` entries may back dates, values, retention, references or production claims; unverified entries expose just client and scope (`app/claims.py`). Matrix and narrative text is checked against this and rejected on violation.
+- **`verified_matches` validated in code.** The model lists the past-performance entries that overlap the solicitation; code keeps only entries whose index exists, is unique and is `verified=true`. The rest go to `rejected_matches` with a reason. Both lists are stored on the decision.
+- **Deterministic verdict floor.** The direction of the verdict is decided by code, not by the model's mood on a given run. The model's `top_reasons` and `rationale_for_verdict` are never changed; the rule changes only verdict and score.
+
+  | Hard blockers | Validated verified matches | Verdict | Score | `verdict_source` |
+  |---|---|---|---|---|
+  | any | any | `no_bid` | capped at 35 | `rule`, reason names the blocker |
+  | none | 0 | `no_bid` | capped at 35 | `rule` |
+  | none | 1-2 | `needs_review` (a model `bid` or `no_bid` is overridden) | clamped to 40-65 | `rule` when the verdict changed; `model` when the model already said `needs_review` |
+  | none | 3+ | the model's verdict | unchanged | `model` |
+
+  The override reason is "one or two verified scope matches: review required, bid not yet supported".
+- **"Draft for human review" footer** on every .docx export.
+- **Confirm-before-save on voice.** Pending rows live in the database only; an entry reaches the firm's past performance after `POST /voice/confirm`.
+
+## What pre-existed vs what was built Oct 26 to Nov 4
+
+**Pre-existing:** CivicProcureBot, a separate private service (<https://github.com/Durl15/civicprocurebot>). RFP Copilot depends on its shortlist endpoint **read-only** (`GET /shortlist/today` is a proxy; nothing here writes to it). The dependency is optional: without it the daily run falls back to demo solicitations and anything ingested in the last 14 days. **Everything in this repository is new.**
+
+Commit summary (from `git log`):
+
+| Date | Commits |
+|---|---|
+| Oct 26 | Day 1 scaffold, Meta client, ingestion; Day 1b Responses API with structured output and reasoning effort; Day 2 firm profiles, agent tools, go/no-go loop; Day 2b function-call handling; Day 3 compliance matrix and title extraction |
+| Oct 27 | Day 4a matrix honesty rules, `requirement_type`, unquoted-claim guard; retry on incomplete output; Day 4b narrative, capability statement, .docx export |
+| Oct 28 | Day 4c verified past-performance matching; Day 4d evaluation row type and compact .docx; stateless-safe loops; Day 4f verified-claims guard; Day 4g narrative rules and the first verdict floor; Day 5 streaming run, token guard, daily run, replay, demo data; Day 6 voice intake with confirm step |
+| Oct 30 | Day 6c voice against live Muse Voice Transcribe (WAV conversion, request/audio parts, hints) |
+| Nov 1 | Day 6d `verified_matches` floor, tagger rules, demo-label route; Day 7a agent console, `GET /solicitations`, admin remove; Day 7b Cloud Run deploy with GCS-synced SQLite, abuse limits, matrix for `needs_review`, run-daily fallback; deploy script fixes |
+| Day 8 | Symmetric verdict floor, solicitation cleanup routes, this README |
+
+## Demo data disclosure
+
+- Demo firms 2 and 3 and the seeded county facilities electrical maintenance solicitation (NAICS 238210, HUBZone, Syracuse) are **fictional** and labeled `DEMO`; none of their clients, contracts, values or references are real.
+- **DASNY RFP 7628** (Small Business Capacity Building Services) is a **real, closed NYS RFP** with its due date shifted forward; the title says so.
+- **DJ AI Business Consultant LLC (firm 1) is a real firm**, and the **Woodfork entry is a real engagement**, confirmed by voice note through the confirm step.
+
+## Run locally
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 copy .env.example .env   # then fill in the keys
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8003
-```
-
-Port 8003 avoids the usual 8000–8002 collisions on the dev machine. Migrations run automatically at startup.
-
-## Configuration
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MODEL_API_KEY` | – | Meta Model API key |
-| `META_API_BASE` | `https://api.meta.ai/v1` | Meta endpoint |
-| `META_MODEL` | `muse-spark-1.3` | Model id |
-| `CIVICPROCUREBOT_API_BASE` | – | CivicProcureBot base URL |
-| `CIVICPROCUREBOT_API_KEY` | – | Sent as `X-API-Key` (assumed header; see `app/shortlist.py`) |
-| `SAM_API_KEY` | – | Only for `sam_notice_id` ingestion |
-| `DB_PATH` | `data/rfp_copilot.sqlite3` | SQLite file (local dev) |
-| `COPILOT_ADMIN_KEY` | – | Required `X-Admin-Key` for `POST /agent/run-daily`, `POST /solicitations/{id}/demo-label` and the past-performance remove route; also bypasses per-IP abuse limits. Blank means those endpoints reject everything |
-| `GCS_BUCKET` | – | GCS bucket for database persistence. Unset = no storage sync (local dev, tests) |
-| `MAX_DAILY_RUNS` | `150` | Global cap on agent runs per rolling 24 hours (429 beyond it) |
-| `LOG_LEVEL` | `INFO` | Python log level |
-| `MAX_RUN_INPUT_TOKENS` | `60000` | Token guard: a run whose first-call input exceeds this stops with `step_failed` |
-| `PRICE_IN_PER_MTOK` / `PRICE_OUT_PER_MTOK` | `0.50` / `2.00` | USD per million tokens for `est_cost_usd`. Assumed rates: set Meta's actual pricing |
-
-Do not wrap values in quotes in Railway or `.env`.
-
-## API
-
-- `POST /solicitations` — one of:
-  - JSON `{"text": "..."}`
-  - multipart with a PDF in field `file`
-  - JSON `{"sam_notice_id": "..."}`
-
-  Returns the tagged record (`due_date`, `naics`, `set_aside`, `participation_goals`, `place_of_performance`, `section_c/l/m`, `file_id`, and `llm_filled`, the list of fields the model had to fill because regex missed them).
-- `GET /solicitations/{id}`
-- `GET /shortlist/today?firm_id=` — CivicProcureBot proxy
-- `POST /agent/run` `{firm_id, solicitation_id, override_no_bid: false}` — Server-Sent Events: go/no-go, then matrix, narrative, capability statement. A `no_bid` verdict stops after go/no-go (reasons in `decision` and `run_complete`) unless `override_no_bid` is true. A `needs_review` verdict runs the compliance matrix only (no narrative or capability statement) and `run_complete.export_url` points at `kind=matrix`; `bid` runs the full chain. The stream sends an SSE `: keepalive` comment every 15 seconds of silence. Events: `run_started`, `step_started`, `tool_call`, `tool_result`, `decision`, `matrix_row`, `narrative`, `capability_statement`, `step_failed`, `run_complete`; each carries `seq` and `timestamp`. The token guard counts input tokens first and stops with `step_failed` above `MAX_RUN_INPUT_TOKENS`.
-- `GET /runs/{run_id}` — the stored event log of a run, for replay with no model spend. Every `llm_calls` row carries its `run_id`; estimated cost is logged per run.
-- `POST /agent/run-daily` `{firm_id}` with header `X-Admin-Key` (`X-API-Key` is still accepted) — pulls the CivicProcureBot shortlist, ingests the top 3 by score, runs the chain on each, and returns a summary list. If the shortlist is unreachable or errors, it falls back to every `demo=true` solicitation plus any ingested in the last 14 days, records a `shortlist_fallback` event (reason included, stored with `solicitation_id` `daily`), and returns the reason under `fallback`. It never fails because the shortlist is down and never sends email.
-- `GET /demo/solicitations`
-- `POST /solicitations/{id}/demo-label` `{demo, title?, due_date?, set_aside?, participation_goals?}` with header `X-Admin-Key` (= `COPILOT_ADMIN_KEY`) — sets `demo` and the given fields; an omitted field is untouched, a field sent as `null` is cleared.
-- `GET /health`
-
-Tagging is regex first (Sections C/L/M, due date, NAICS, set-aside, place of performance); a single structured-output Muse Spark call fills only the gaps and never overwrites a regex hit. If that call fails, the regex result is stored as-is.
-
-- `set_aside` is a category the contract is restricted to (HUBZone, 8(a), SDVOSB, WOSB, small business). Utilization goals such as "MBE 18%, WBE 12%, SDVOB 6%" are not a set-aside; they go in `participation_goals`.
-- `due_date` is the proposal/response due date. Questions deadlines, pre-proposal conferences and issue dates never qualify; when only those are present the regex pass leaves it empty and the model fills it.
-- State and local solicitations have no federal Section C/L/M labels. The model maps their scope, submission instructions and evaluation criteria onto C, L and M, and `llm_filled` records which fields it filled.
-
-## Go/no-go past-performance floor
-
-The model returns `verified_matches` (`{entry_index, why}`) for the past-performance entries it relied on; `entry_index` is shown in `get_firm_profile` and `search_past_performance`. Code keeps only entries whose index exists, is unique, and has `verified=true`; the rest go to `rejected_matches` with a reason. The floor counts the kept list: 0 forces `no_bid` (score cap 35), 1-2 cap at `needs_review` (score cap 65), 3+ leave the verdict alone, and hard blockers force `no_bid`. Both lists are stored on the decision and returned in `decision`.
-
-## Voice intake
-
-`POST /voice/past-performance` (multipart: `audio`, `firm_id`, optional `hints`) accepts any audio upload (m4a, mp3, wav, ogg, webm, aac). It is converted with ffmpeg to 16 kHz mono 16-bit PCM WAV, transcribed, then extracted into a pending entry that only reaches the firm's past performance after `POST /voice/confirm`. `hints` is a comma-separated list of proper nouns (e.g. `The Woodfork Group, East Adams`); a transcribed name that is a close phonetic match is written with the hint spelling in the field value while the evidence quote stays verbatim. Unreadable audio returns 400 `unsupported or corrupt audio`; ASR failures return 502 after one retry on 5xx/timeout.
-
-Muse Voice Transcribe contract (`POST {META_API_BASE}/asr/transcribe`, bearer `MODEL_API_KEY`):
-
-- Multipart with exactly two parts: `request` (`application/json`: `{"model": "muse-voice-transcribe-1.0", "audioEncoding": "WAV"}`) and `audio` (`audio/wav`). Other part names return 400.
-- WAV only, mono 16-bit PCM at 16 or 24 kHz. m4a, mp3 and other encodings are rejected.
-- 200 response: `{"sessionId", "transcript", "audioDurationMs", "turns": []}`.
-
-Conversion uses ffmpeg from the `imageio-ffmpeg` package (no system ffmpeg). The `imageio-ffmpeg` 0.7.0 `manylinux2014_x86_64` wheel bundles a linux x86_64 ffmpeg binary, so the Railway image needs no change.
-
-Smoke test (one real call): `python scripts/voice_smoke.py <audio> [firm_id] [--hints "a, b"]`.
-
-## Deploy (Google Cloud Run)
-
-Project `dj-ai-grant-consultant`, region `us-east1`, service `rfp-copilot`. **The Cloud Run service URL is the live product link for the hackathon submission.** Run from the repo root in PowerShell, with `gcloud` authenticated and `MODEL_API_KEY` and `COPILOT_ADMIN_KEY` set in `.env`:
-
-```powershell
-.\scripts\seed_prod.ps1       # once, before the first deploy: uploads datafp_copilot.sqlite3 to gs://rfp-copilot-data (refuses if it already exists; -Force overrides)
-.\scripts\deploy.ps1          # idempotent: APIs, bucket, service account, secrets, Cloud Build + deploy, then GET /health and /solicitations
-.\scripts\schedule_daily.ps1  # creates or updates Cloud Scheduler job rfp-copilot-daily: 07:30 America/New_York, POST /agent/run-daily
-```
-
-`seed_prod.ps1` makes production start with the DASNY 7628 solicitation and the confirmed Woodfork entry from your local database. Secret values are read from `.env` (deploy) or Secret Manager (schedule) and never printed.
-
-| Variable | Cloud Run value | Source |
-|---|---|---|
-| `MODEL_API_KEY` | – | Secret Manager `MODEL_API_KEY` |
-| `COPILOT_ADMIN_KEY` | – | Secret Manager `COPILOT_ADMIN_KEY` |
-| `META_API_BASE` | `https://api.meta.ai/v1` | env var |
-| `META_MODEL` | `muse-spark-1.3` | env var |
-| `DB_PATH` | `/tmp/rfp_copilot.sqlite3` | env var |
-| `GCS_BUCKET` | `rfp-copilot-data` | env var |
-| `LOG_LEVEL` | `INFO` | env var |
-| `MAX_DAILY_RUNS` | `150` | env var |
-
-`CIVICPROCUREBOT_API_BASE`, `CIVICPROCUREBOT_API_KEY` and `SAM_API_KEY` are not set by `deploy.ps1`; until they are, the daily run uses its shortlist fallback.
-
-### Persistence model
-
-SQLite runs on the container's ephemeral disk at `DB_PATH` and is mirrored to `gs://$GCS_BUCKET/rfp_copilot.sqlite3` as a whole file (`app/storage.py`):
-
-- On startup, if the bucket has the file it is downloaded **before** migrations and seeding. A storage error at that point aborts startup, so an empty database can never overwrite the real one.
-- After any committed write (ingest, decision, confirm, reject, remove, run events), an upload is scheduled 5 seconds out; writes in that window share the one upload. The upload is a consistent snapshot (sqlite backup API, WAL-safe). Shutdown uploads once more. Each sync is logged at INFO with its byte size.
-- Seeding only inserts missing firms and the demo solicitation; restarts never duplicate rows.
-- **Single-instance constraint:** whole-file sync has no merge, so two instances would overwrite each other. The service is deployed with `--min-instances 1 --max-instances 1` (one writer, no cold start during the demo) and `--no-cpu-throttling` so the debounced upload and in-flight runs get CPU outside a request. Writes in the last 5 seconds before a crash can be lost.
-
-### Abuse limits
-
-The URL is public, so (in memory, per process, which is correct only with one instance):
-
-- Per IP: 6 agent runs per hour across `POST /agent/run`, `/agent/go-no-go` and `/agent/matrix`, and 10 uploads per hour on `POST /voice/past-performance`. Requests with a valid `X-Admin-Key` bypass the per-IP limits. The IP is the last `X-Forwarded-For` entry (the address Cloud Run appends).
-- Global: `MAX_DAILY_RUNS` (default 150) agent runs per rolling 24 hours, admin included. `POST /agent/run-daily` is not counted.
-- Both return `429` with a plain message. Voice uploads over 25 MB return `413`.
-
-## Console
-
-Open the agent console at `GET /` (a static page, no build step: `app/static/index.html`, `console.js`, `console.css`). Left: firm, past performance (VERIFIED/UNVERIFIED), solicitation picker. Center: **Run agent** streams `POST /agent/run` as a live trace, then the verdict card, Matrix / Narrative / Capability tabs and .docx downloads. **Replay last run** plays the stored events at 8x. Right: voice intake (upload or record, confirm or reject).
-
-![Agent console](docs/console.png)
-
-`GET /solicitations` lists demo and ingested solicitations newest first. `DELETE /firms/{firm_id}/past-performance/{entry_index}` (header `X-Admin-Key` = `COPILOT_ADMIN_KEY`) removes an entry and records a `past_performance_removed` event; the console's Remove button asks for the key once per browser session.
-
-Demo reset sequence between takes:
-
-1. Remove the Woodfork entry (Remove button on its VERIFIED row).
-2. Run the agent: `no_bid` by rule (zero verified matches).
-3. Record the voice note, review the fields, **Confirm**: the entry appears as VERIFIED.
-4. Run the agent again: `needs_review`.
-
-## Demo data
-
-**Demo firms and demo solicitations are fictional.** Firms 2 and 3 (`demo=true`) and the seeded county facilities electrical maintenance solicitation (NAICS 238210, HUBZone set-aside, Syracuse) are invented for demonstration; none of their clients, contracts, values or references are real. Firm 2 carries three `verified=true` past-performance entries that match the demo solicitation, so a run on it reaches a `bid` or `needs_review` verdict. Firm 1 is the only real firm.
-
-The DASNY RFP 7628 (Small Business Capacity Building Services) demo solicitation is a real, closed NYS RFP with its due date shifted forward, and its title says so. It is labelled with `POST /solicitations/{id}/demo-label`, not by editing the database.
-
-## Tests
-
-```powershell
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Drop sample solicitations in `tests/fixtures/*.pdf` to enable the real-PDF tagger test; it skips when the folder is empty.
+Port 8003 avoids the usual 8000-8002 collisions. Migrations run at startup. Drop sample PDFs in `tests/fixtures/*.pdf` to enable the real-PDF tagger test.
 
-## Known limits
+## Deploy (Google Cloud Run)
 
-- SQLite with whole-file GCS sync, single instance only (see Deploy). Move to Postgres before real multi-user data lands.
-- Token counting uses the Responses API `input_tokens` endpoint (`MetaClient.count_input_tokens`); it is not verified against Meta's live API. If it fails, the run stops at the token guard rather than spending unchecked.
-- Scanned (image-only) PDFs are rejected: no OCR yet.
-- Only Sections C, L, and M are captured.
+Project `dj-ai-grant-consultant`, region `us-east1`, service `rfp-copilot`. Run from the repo root in PowerShell, `gcloud` authenticated, `MODEL_API_KEY` and `COPILOT_ADMIN_KEY` set in `.env`:
+
+```powershell
+.\scripts\seed_prod.ps1       # once, before the first deploy: uploads the local database to gs://rfp-copilot-data (refuses if it exists; -Force overrides)
+.\scripts\deploy.ps1          # idempotent: APIs, bucket, service account, secrets, Cloud Build + deploy, then GET /health and /solicitations
+.\scripts\schedule_daily.ps1  # Cloud Scheduler job rfp-copilot-daily: 07:30 America/New_York, POST /agent/run-daily
+```
+
+Secret values are read from `.env` (deploy) or Secret Manager (schedule) and never printed.
+
+### Environment
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MODEL_API_KEY` | - | Meta Model API key (Secret Manager on Cloud Run) |
+| `META_API_BASE` | `https://api.meta.ai/v1` | Meta endpoint |
+| `META_MODEL` | `muse-spark-1.3` | Model id |
+| `COPILOT_ADMIN_KEY` | - | `X-Admin-Key` for `POST /agent/run-daily`, demo-label, past-performance remove, solicitation delete and dedupe; also bypasses per-IP abuse limits. Blank means those endpoints reject everything (Secret Manager on Cloud Run) |
+| `CIVICPROCUREBOT_API_BASE` / `CIVICPROCUREBOT_API_KEY` | - | Optional shortlist source; not set by `deploy.ps1`, so the daily run uses its fallback until they are |
+| `SAM_API_KEY` | - | Only for `sam_notice_id` ingestion |
+| `DB_PATH` | `data/rfp_copilot.sqlite3` | SQLite file (`/tmp/rfp_copilot.sqlite3` on Cloud Run) |
+| `GCS_BUCKET` | - | Bucket for database persistence; unset means no sync (local dev, tests) |
+| `MAX_DAILY_RUNS` | `150` | Global cap on agent runs per rolling 24 hours (429 beyond it) |
+| `MAX_RUN_INPUT_TOKENS` | `60000` | Token guard: a run whose first-call input exceeds this stops with `step_failed` |
+| `PRICE_IN_PER_MTOK` / `PRICE_OUT_PER_MTOK` | `0.50` / `2.00` | USD per million tokens for `est_cost_usd` |
+| `LOG_LEVEL` | `INFO` | Python log level |
+
+Do not wrap values in quotes in `.env` or Secret Manager.
+
+### Abuse limits
+
+In memory, per process (correct because the service runs one instance):
+
+- Per IP: 6 agent runs per hour across `POST /agent/run`, `/agent/go-no-go` and `/agent/matrix`; 10 voice uploads per hour. A valid `X-Admin-Key` bypasses the per-IP limits. The IP is the last `X-Forwarded-For` entry (the address Cloud Run appends).
+- Global: `MAX_DAILY_RUNS` agent runs per rolling 24 hours, admin included. `POST /agent/run-daily` is not counted.
+- Both return `429`. Voice uploads over 25 MB return `413`.
+
+### Costs
+
+`est_cost_usd` per run is tokens times `PRICE_IN_PER_MTOK` / `PRICE_OUT_PER_MTOK`. **Those prices are placeholders until Meta publishes rates in the console**; treat the estimate as a relative figure, not a bill. Cost is logged per run, and every `llm_calls` row carries its `run_id`.
+
+### Persistence
+
+SQLite on the container's ephemeral disk, mirrored as a whole file to `gs://$GCS_BUCKET/rfp_copilot.sqlite3` (`app/storage.py`). On startup the bucket copy is downloaded before migrations and seeding (a storage error aborts startup so an empty database never overwrites the real one). After a committed write an upload is scheduled 5 seconds out (WAL-safe backup snapshot); shutdown uploads once more. The service runs `--min-instances 1 --max-instances 1` with `--no-cpu-throttling`; writes in the last 5 seconds before a crash can be lost.
+
+## API
+
+- `POST /solicitations`: JSON `{"text"}`, multipart PDF in `file`, or JSON `{"sam_notice_id"}`. Returns the tagged record (`due_date`, `naics`, `set_aside`, `participation_goals`, `place_of_performance`, `section_c/l/m`, `file_id`, `llm_filled`).
+- `GET /solicitations`, `GET /solicitations/{id}`, `GET /demo/solicitations`
+- `DELETE /solicitations/{id}` (`X-Admin-Key`): deletes the solicitation and its decisions, matrix rows, artifacts and runs; returns the counts.
+- `POST /solicitations/dedupe[?dry_run=true]` (`X-Admin-Key`): removes rows with an empty or null title, and for rows sharing a title and source keeps the newest. `dry_run=true` returns the plan without deleting.
+- `POST /solicitations/{id}/demo-label` `{demo, title?, due_date?, set_aside?, participation_goals?}` (`X-Admin-Key`): an omitted field is untouched, a field sent as `null` is cleared.
+- `POST /agent/run` `{firm_id, solicitation_id, override_no_bid}`: SSE. `no_bid` stops after go/no-go unless `override_no_bid`; `needs_review` runs the matrix only; `bid` runs the full chain. Events: `run_started`, `step_started`, `tool_call`, `tool_result`, `decision`, `matrix_row`, `narrative`, `capability_statement`, `step_failed`, `run_complete`.
+- `GET /runs/{run_id}`: stored event log and usage, for replay.
+- `POST /agent/run-daily` `{firm_id}` (`X-Admin-Key`): shortlist top 3, ingest, run the chain. On shortlist failure it falls back to demo and recent solicitations and reports the reason. It never sends email.
+- `POST /voice/past-performance`, `POST /voice/confirm`, `POST /voice/reject`; `DELETE /firms/{firm_id}/past-performance/{entry_index}` (`X-Admin-Key`); `GET /shortlist/today?firm_id=`; `GET /health`.
+
+Tagging is regex first (Sections C/L/M, due date, NAICS, set-aside, place of performance); one structured-output call fills only the gaps and never overwrites a regex hit. State and local solicitations have no federal C/L/M labels, so the model maps scope, submission instructions and evaluation criteria onto C, L and M and `llm_filled` records it.
+
+Voice contract (`POST {META_API_BASE}/asr/transcribe`, bearer `MODEL_API_KEY`): two multipart parts, `request` (`{"model": "muse-voice-transcribe-1.0", "audioEncoding": "WAV"}`) and `audio` (`audio/wav`); mono 16-bit PCM at 16 or 24 kHz. Conversion uses ffmpeg from `imageio-ffmpeg`. Smoke test: `python scripts/voice_smoke.py <audio> [firm_id] [--hints "a, b"]`.
+
+## Known limits and what's next
+
+- SQLite with whole-file GCS sync, single instance only. Move to Postgres before real multi-user data lands.
+- `count_input_tokens` uses the Responses API `input_tokens` endpoint and is not verified against Meta's live API; if it fails, the run stops at the guard rather than spending unchecked.
+- Scanned (image-only) PDFs are rejected: no OCR. Only Sections C, L and M are captured.
+- Cost figures use placeholder prices.
+
+Next: TradesBrain voice intake, an open-weight side-by-side on the same inputs, and a CivicProcureBot Pro tier.

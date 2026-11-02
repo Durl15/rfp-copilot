@@ -20,7 +20,7 @@ router = APIRouter()
 MAX_TURNS = 8
 MAX_TOKENS = 8000
 SUMMARY_CHARS = 200
-ZERO_MATCH_CAP, FEW_MATCH_CAP = 35, 65
+ZERO_MATCH_CAP, FEW_MATCH_FLOOR, FEW_MATCH_CAP = 35, 40, 65
 # record_decision is persisted by this module after the final answer, so the model never sees it.
 MODEL_TOOLS = [d for d in tools.TOOL_DEFINITIONS if d["name"] != "record_decision"]
 
@@ -31,16 +31,17 @@ SYSTEM_PROMPT = (
     "blockers lists ONLY hard disqualifiers: a required certification the firm lacks, a set-aside the firm does not "
     "qualify for, a NAICS code outside the firm's codes, or a due date that has already passed. Weak fit, thin past "
     "performance, or effort concerns are NOT blockers; put them in top_reasons. "
-    "Past-performance entries carry an entry_index. verified_matches lists ONLY the entries you relied on as "
-    "scope-relevant to this solicitation, each as {entry_index, why} with why one sentence; list an entry only if its "
-    "scope matches the work, and use [] if none do. "
+    "Past-performance entries carry an entry_index. verified_matches lists EVERY firm entry marked verified whose scope "
+    "overlaps the solicitation in any material way, each as {entry_index, why} with why one sentence; relevance strength "
+    "belongs in top_reasons, not in the decision to list. Use [] only if no verified entry overlaps. "
     "Past-performance entries with verified false show relevance only: never count them as proof of capability, and say "
     "in top_reasons what proof the firm must supply. "
     "top_reasons has at most 3 entries and the FIRST must be the single decisive factor behind the verdict. "
     "Score 0-100 for fit (70+ bid, 40-69 needs_review, below 40 no_bid unless a blocker says otherwise). "
     "Code enforces a past-performance floor after you answer, counting only the entries in verified_matches that exist "
-    "and have verified true: zero verified matches forces no_bid and caps the score at 35; one or two force needs_review at "
-    "most and cap the score at 65; three or more leave your verdict unchanged. Hard blockers always force no_bid. "
+    "and have verified true: zero verified matches forces no_bid and caps the score at 35; one or two force needs_review "
+    "with the score clamped to 40-65, whatever you answered; three or more leave your verdict unchanged. Hard blockers "
+    "always force no_bid with the score capped at 35. "
     "Keep your verdict, score and reasons consistent with this rule. "
     "rationale_for_verdict is ONE sentence explaining why the verdict is bid, needs_review, or no_bid rather than the other two. "
     "When you have enough information, reply with the final JSON decision only."
@@ -96,7 +97,7 @@ GO_NO_GO_SCHEMA = {
                 "required": ["entry_index", "why"],
                 "additionalProperties": False,
             },
-            "description": "Only the past-performance entries relied on as scope-relevant; [] if none",
+            "description": "EVERY verified firm entry whose scope overlaps the solicitation in any material way; [] if none",
         },
     },
     "required": list(GoNoGo.model_fields),
@@ -123,28 +124,25 @@ def validate_matches(matches: list[VerifiedMatch], firm: dict) -> tuple[list[dic
 
 
 def apply_floor(decision: GoNoGo, verified: int) -> dict:
-    """The decision as a dict with the code-enforced floor applied; verdict_source is 'rule' only when the verdict changed."""
+    """The decision as a dict with the code-enforced floor applied to verdict and score only.
+
+    verdict_source is 'rule' whenever a rule decided or altered the outcome, 'model' when the model's answer stands."""
     out = decision.model_dump(exclude={"verified_matches"})
-    verdict, score, reason = decision.verdict, decision.score, ""
+    verdict, score, source, reason = decision.verdict, decision.score, "model", ""
     if decision.blockers:
-        verdict, reason = "no_bid", "Hard blocker: " + "; ".join(decision.blockers)
+        verdict, score, source = "no_bid", min(score, ZERO_MATCH_CAP), "rule"
+        reason = "Hard blocker: " + "; ".join(decision.blockers)
     elif verified == 0:
-        verdict, score = "no_bid", min(score, ZERO_MATCH_CAP)
+        verdict, score, source = "no_bid", min(score, ZERO_MATCH_CAP), "rule"
         reason = "No verified past performance matches this solicitation's scope; verdict forced to no_bid, score capped at 35."
     elif verified < PP_CLEAR_MIN:
-        score = min(score, FEW_MATCH_CAP)
-        if verdict == "bid":
-            verdict = "needs_review"
-        reason = (f"Only {verified} verified past-performance match(es), fewer than {PP_CLEAR_MIN}; "
-                  "verdict capped at needs_review, score capped at 65.")
-    changed = (verdict, score) != (decision.verdict, decision.score)
-    out.update(
-        verdict=verdict, score=score,
-        verdict_source="rule" if verdict != decision.verdict else "model",
-        rule_reason=reason if changed or decision.blockers else "",
-    )
-    if changed:
-        out["top_reasons"] = [reason, *decision.top_reasons][:3]
+        score = min(max(score, FEW_MATCH_FLOOR), FEW_MATCH_CAP)
+        if verdict != "needs_review":
+            verdict, source = "needs_review", "rule"
+            reason = "one or two verified scope matches: review required, bid not yet supported"
+        elif score != decision.score:
+            reason = f"Score clamped to {FEW_MATCH_FLOOR}-{FEW_MATCH_CAP} for one or two verified scope matches."
+    out.update(verdict=verdict, score=score, verdict_source=source, rule_reason=reason)
     return out
 
 
