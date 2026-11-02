@@ -1,7 +1,7 @@
-# Creates or updates the Cloud Scheduler job that triggers the daily run at 7:30 AM Eastern.
+﻿# Creates or updates the Cloud Scheduler job that triggers the daily run at 7:30 AM Eastern.
 # The admin key is read from Secret Manager at run time and is never printed.
 param([int]$FirmId = 1)
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $Project = "dj-ai-grant-consultant"
 $Region = "us-east1"
 $Service = "rfp-copilot"
@@ -25,3 +25,5 @@ $verb = if ($LASTEXITCODE -eq 0) { "update" } else { "create" }
     --attempt-deadline 900s | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "gcloud scheduler jobs $verb failed" }
 Write-Host "Scheduler job $Job ${verb}d: 07:30 America/New_York -> POST $url/agent/run-daily (firm_id $FirmId)"
+
+

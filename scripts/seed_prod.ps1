@@ -1,4 +1,4 @@
-# Uploads the local database to gs://rfp-copilot-data so production starts with its solicitations and confirmed
+﻿# Uploads the local database to gs://rfp-copilot-data so production starts with its solicitations and confirmed
 # past-performance entries. Run ONCE, before the first deploy. Refuses to overwrite an existing bucket copy unless -Force.
 param([switch]$Force)
 $ErrorActionPreference = "Stop"
@@ -35,3 +35,4 @@ try {
 } finally {
     Remove-Item $snapshot -Force -ErrorAction SilentlyContinue
 }
+

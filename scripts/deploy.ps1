@@ -1,4 +1,4 @@
-# Deploys RFP Copilot to Cloud Run. Idempotent: safe to re-run; each run adds a new secret version and a new revision.
+﻿# Deploys RFP Copilot to Cloud Run. Idempotent: safe to re-run; each run adds a new secret version and a new revision.
 # Prerequisite: scripts\seed_prod.ps1 has been run once. Secret values are read from .env and never printed.
 $ErrorActionPreference = "Stop"
 $Project = "dj-ai-grant-consultant"
@@ -10,11 +10,13 @@ $SaEmail = "$Sa@$Project.iam.gserviceaccount.com"
 $Root = Split-Path -Parent $PSScriptRoot
 
 function Gcloud {
-    & gcloud @args --project $Project --quiet
+    $ErrorActionPreference = "Continue"
+    & gcloud.cmd @args --project $Project --quiet 2>&1 | ForEach-Object { "$_" }
     if ($LASTEXITCODE -ne 0) { throw "gcloud $($args[0..2] -join ' ') failed (exit $LASTEXITCODE)" }
 }
 function Gcloud-Ok {  # true when the command succeeds; output suppressed
-    & gcloud @args --project $Project --quiet *> $null
+    $ErrorActionPreference = "Continue"
+    & gcloud.cmd @args --project $Project --quiet *> $null
     return ($LASTEXITCODE -eq 0)
 }
 function Read-EnvValue([string]$Name) {
@@ -79,3 +81,4 @@ Invoke-RestMethod "$url/health" | ConvertTo-Json -Compress
 Write-Host "GET /solicitations"
 $sols = Invoke-RestMethod "$url/solicitations"
 Write-Host ("{0} solicitation(s): {1}" -f @($sols).Count, ((@($sols) | ForEach-Object { $_.title }) -join "; "))
+
