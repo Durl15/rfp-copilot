@@ -21,9 +21,10 @@ $verb = if ($LASTEXITCODE -eq 0) { "update" } else { "create" }
     --schedule "30 7 * * *" --time-zone "America/New_York" `
     --uri "$url/agent/run-daily" --http-method POST `
     --headers "X-Admin-Key=$key,Content-Type=application/json" `
-    --message-body "{`"firm_id`": $FirmId}" `
+    --message-body ("{""firm_id"": " + $FirmId + "}") `
     --attempt-deadline 900s | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "gcloud scheduler jobs $verb failed" }
 Write-Host "Scheduler job $Job ${verb}d: 07:30 America/New_York -> POST $url/agent/run-daily (firm_id $FirmId)"
+
 
 
