@@ -16,15 +16,18 @@ if ($key -match ",") { throw "COPILOT_ADMIN_KEY contains a comma, which gcloud's
 
 & gcloud scheduler jobs describe $Job --location $Region --project $Project --quiet *> $null
 $verb = if ($LASTEXITCODE -eq 0) { "update" } else { "create" }
+$bodyFile = Join-Path $PSScriptRoot "daily_body.json"
+Set-Content -Path $bodyFile -Value "{""firm_id"": $FirmId}" -NoNewline -Encoding ascii
 
 & gcloud scheduler jobs $verb http $Job --location $Region --project $Project --quiet `
     --schedule "30 7 * * *" --time-zone "America/New_York" `
     --uri "$url/agent/run-daily" --http-method POST `
     --headers "X-Admin-Key=$key,Content-Type=application/json" `
-    --message-body ("{""firm_id"": " + $FirmId + "}") `
+    --message-body-from-file $bodyFile `
     --attempt-deadline 900s | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "gcloud scheduler jobs $verb failed" }
 Write-Host "Scheduler job $Job ${verb}d: 07:30 America/New_York -> POST $url/agent/run-daily (firm_id $FirmId)"
+
 
 
 
